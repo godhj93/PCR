@@ -70,10 +70,10 @@ def compute_metrics(
     predicted_target = source @ R_est.T + t_est
 
     return {
-        "rmse": rmse(predicted_target, target),
-        "rre_rad": relative_rotation_error(R_gt, R_est, degrees=False),
-        "rre_deg": relative_rotation_error(R_gt, R_est, degrees=True),
-        "rte": relative_translation_error(t_gt, t_est),
-        "rreg": relative_registration_error(source, target, transform_gt, transform_est),
+        "RMSE": rmse(predicted_target, target),
+        "RRE(rad)": relative_rotation_error(R_gt, R_est, degrees=False),
+        "RRE(deg)": relative_rotation_error(R_gt, R_est, degrees=True),
+        "RTE": relative_translation_error(t_gt, t_est),
+        "RREG": relative_registration_error(source, target, transform_gt, transform_est),
     }
 

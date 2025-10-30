@@ -3,7 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from matplotlib.animation import FuncAnimation
-from flow_matching.flow_matching.utils.manifolds.se3 import SE3
+from flow_matching.utils.manifolds.se3 import SE3
 
 # --- Matplotlib 3D 좌표계 그리기 헬퍼 함수 (이전과 동일) ---
 def draw_frame(ax, T, scale=0.2, alpha=1.0, label=None):

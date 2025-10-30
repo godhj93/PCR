@@ -1,0 +1,22 @@
+training:
+  batch_size: 64
+  epochs: 100
+  seed: 42
+  num_samples: 10000
+  num_points: 1024
+  point_scale: 2.0
+  translation_scale: 0.5
+  target_noise_std: 0.01
+  overlap_ratio: 0.8
+  target_point_ratio: 1.0
+  shape: cube
+
+optimizer:
+  name: adam
+  lr: 0.001
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  momentum: null
+  nesterov: false
+  use_scheduler: false
+  scheduler: null

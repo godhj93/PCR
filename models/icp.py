@@ -111,12 +111,14 @@ def iterative_closest_point(
 
     source_device = source.to(device=device, dtype=dtype)
     target_device = target.to(device=device, dtype=dtype)
+    converged = False
 
     for iteration in range(1, max_iterations + 1):
         transformed = apply_transform(source_device, T)
 
         distances, indices = kdtree.query(transformed.detach().cpu().numpy())
-        matched = target_device[indices]
+        indices_tensor = torch.as_tensor(indices, device=target_device.device, dtype=torch.long)
+        matched = target_device.index_select(0, indices_tensor)
 
         src_centroid = transformed.mean(dim=0, keepdim=True)
         tgt_centroid = matched.mean(dim=0, keepdim=True)
@@ -147,10 +149,10 @@ def iterative_closest_point(
         transform_history.append(T.detach().clone())
 
         if torch.abs(prev_error - current_error) < tolerance:
+            converged = True
             break
         prev_error = current_error
 
-    converged = len(errors) < max_iterations
     rotation = T[:3, :3]
     translation = T[:3, 3]
     return ICPResult(
@@ -178,11 +180,16 @@ if __name__ == "__main__":  # PointRegistrationDataset 기반 간단 검증
         dtype=dtype,
         seed=42,
         shape="sphere",
+        overlap_ratio=0.7,
+        target_point_ratio=1.2,
     )
     sample = dataset[0]
     source = sample.source.to(device)
     target = sample.target.to(device)
     true_transform = sample.transform.to(device)
+    overlap_count = sample.overlap_count
+    overlap_source = source[:overlap_count]
+    overlap_target = target[:overlap_count]
 
     axis_noise = torch.tensor([0.2, -0.3, 0.5], device=device, dtype=dtype)
     axis_noise = axis_noise / axis_noise.norm()
@@ -205,7 +212,7 @@ if __name__ == "__main__":  # PointRegistrationDataset 기반 간단 검증
     result = iterative_closest_point(
         source,
         target,
-        max_iterations=60,
+        max_iterations=1000,
         tolerance=1e-9,
         initial_rotation=torch.eye(3, device=device, dtype=dtype),  # 혹은 큰 각도 노이즈
         initial_translation=torch.zeros(3, device=device, dtype=dtype),
@@ -213,8 +220,8 @@ if __name__ == "__main__":  # PointRegistrationDataset 기반 간단 검증
 
 
     metrics = compute_metrics(
-        source=source,
-        target=target,
+        source=overlap_source,
+        target=overlap_target,
         transform_gt=true_transform,
         transform_est=result.transform,
     )
@@ -223,6 +230,7 @@ if __name__ == "__main__":  # PointRegistrationDataset 기반 간단 검증
     print(true_transform.cpu().numpy())
     print("\nEstimated transform T_icp:")
     print(result.transform.cpu().numpy())
+    print(f"\nOverlap count: {overlap_count} / source={source.shape[0]} / target={target.shape[0]}")
     print(f"\nIterations: {result.iterations} | Converged: {result.converged}")
     if result.errors:
         print(f"Final mean correspondence error: {result.errors[-1]:.6f}")
@@ -230,8 +238,8 @@ if __name__ == "__main__":  # PointRegistrationDataset 기반 간단 검증
     print_metrics(metrics, header="Metrics (RMSE / RRE / RTE / RReg)")
 
     frame_metrics = compute_metrics_over_transforms(
-        source,
-        target,
+        overlap_source,
+        overlap_target,
         result.transform_history,
         transform_gt=true_transform,
     )

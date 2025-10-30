@@ -9,6 +9,7 @@ from .geodesic import GeodesicProbPath
 from .mixture import MixtureDiscreteProbPath
 from .path import ProbPath
 from .path_sample import DiscretePathSample, PathSample
+from .tau_constrained_rigid_path import TauConstrainedRigidPath
 
 
 __all__ = [
@@ -17,6 +18,7 @@ __all__ = [
     "CondOTProbPath",
     "MixtureDiscreteProbPath",
     "GeodesicProbPath",
+    "TauConstrainedRigidPath",
     "PathSample",
     "DiscretePathSample",
 ]
