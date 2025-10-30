@@ -250,7 +250,7 @@ if __name__ == "__main__":
         target_noise_std=0.02,
         seed=42,
         shape="sphere",
-        overlap_ratio=0.7,
+        overlap_ratio=0.1,
     )
     sample = dataset[0]
     source = sample.source
@@ -261,7 +261,6 @@ if __name__ == "__main__":
     overlap_count = sample.overlap_count
     overlap_source = source[:overlap_count]
     overlap_target = target[:overlap_count]
-
     # SE(3) 로그맵으로 twist를 구하고, 지수맵으로 다시 복원해본다.
     se3 = SE3()
     identity = torch.eye(4, dtype=dataset.dtype)
@@ -285,35 +284,6 @@ if __name__ == "__main__":
     target_np = target.numpy()
     rotation_np = rotation.numpy()
     translation_np = translation.numpy()
-
-    import matplotlib.pyplot as plt  # type: ignore
-
-    fig = plt.figure(figsize=(8, 6))
-    ax = fig.add_subplot(111, projection="3d")
-    ax.scatter(source_np[:, 0], source_np[:, 1], source_np[:, 2], s=3, alpha=0.6, label="source")
-    ax.scatter(target_np[:, 0], target_np[:, 1], target_np[:, 2], s=3, alpha=0.6, label="target")
-    ax.set_xlabel("X")
-    ax.set_ylabel("Y")
-    ax.set_zlabel("Z")
-    ax.legend()
-    ax.set_title(
-        "Synthetic Point Registration Pair\n"
-        f"Shape={dataset.shape} | det(R)={torch.linalg.det(rotation):.3f} | "
-        f"RMSE={registration_rmse:.4f}, RRE={rotation_error_deg:.2f}deg, "
-        f"RTE={translation_error:.4f}, RReg={relative_reg_error:.4f}"
-    )
-
-    print("기준 변환 T_true의 회전 행렬 R:")
-    print(rotation_np)
-    print("\n기준 평행이동 벡터 t:")
-    print(translation_np)
-    print(f"\n겹치는 점 개수: {overlap_count} / source={source.shape[0]} / target={target.shape[0]}")
-    print("\nSE(3) 로그맵에서 얻은 twist [rho(평행이동), phi(회전)]:")
-    print(twist6.numpy())
-    print_metrics(metrics, header="정합 평가 지표 (RMSE / RRE / RTE / RReg)")
-
-    plt.tight_layout()
-    plt.savefig("random_point_cloud.png", dpi=300)
 
     # 로그맵으로 얻은 변환을 등분해하여 애니메이션으로 저장
     geodesic_steps = 60
@@ -390,14 +360,17 @@ if __name__ == "__main__":
     # print(f"midpoint velocity mean norm: {midpoint_velocity_norm:.6f}")
 
     create_registration_comparison_animation(
-        overlap_source,
-        overlap_target,
+        source,
+        target,
         geodesic_transforms,
         tau_transforms,
-        filename="registration_comparison.gif",
+        filename="registration_comparison.mp4",
         frame_times=[float(v) for v in geodesic_ts.tolist()],
         frame_metrics_a=geodesic_metrics,
         frame_metrics_b=tau_metrics,
         titles=("SE(3) Geodesic", "Tau-Constrained Rigid Path"),
+        overlap_count=overlap_count,
+        overlap_alpha=0.8,
+        unique_alpha=0.25,
     )
-    print("비교 애니메이션을 'registration_comparison.gif'로 저장했습니다.")
+    print("비교 애니메이션을 'registration_comparison.mp4'로 저장했습니다.")

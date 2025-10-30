@@ -23,12 +23,14 @@ def _kabsch_rotation(Pc: Tensor, Qc: Tensor) -> Tensor:
     """
     H = torch.einsum("...ni,...nj->...ij", Pc, Qc)  # (..., 3, 3)
     U, _, Vh = torch.linalg.svd(H)
-    det = torch.det(U @ Vh)
+    V = Vh.transpose(-1, -2)
+    Ut = U.transpose(-1, -2)
+    det = torch.det(V @ Ut)
     batch_shape = det.shape
     D = torch.eye(3, dtype=H.dtype, device=H.device).expand(batch_shape + (3, 3)).clone()
     det_sign = torch.where(det < 0, -torch.ones_like(det), torch.ones_like(det))
     D[..., 2, 2] = det_sign
-    return U @ D @ Vh
+    return V @ D @ Ut
 
 
 class TauConstrainedRigidPath(ProbPath):
