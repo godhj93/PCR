@@ -2,7 +2,8 @@ import torch
 from tqdm import tqdm
 from utils.model import FLOW
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D # 3D 플롯을 위해 필요
+from mpl_toolkits.mplot3d import Axes3D 
+import numpy as np
 
 def train_one_epoch(model: FLOW, train_loader, optimizer, loss_fn, epoch, cfg):
     model.train() 
@@ -203,3 +204,34 @@ def test_one_epoch(model: FLOW, test_loader, loss_fn, cfg, epoch=0, visualize=Fa
     accuracy = (all_pred_corrs_tensor == all_gt_corrs_tensor).all(dim=2).float().mean().item()
     
     return avg_test_loss, accuracy
+
+def visualize_registration(P, Q, R, t, vis, title="Registration Result"):
+    """
+    P: (3, N) source point cloud
+    Q: (3, N) target point cloud
+    R: (3, 3) rotation matrix
+    t: (3,) translation vector
+    """
+    # P를 변환하여 Q와 정합 (P_transformed = R * P + t)
+    P_transformed = R @ P + t[:, None]
+
+    fig = plt.figure(figsize=(12, 6))
+
+    # 1. 정합 전 (Before Registration)
+    ax1 = fig.add_subplot(121, projection='3d')
+    ax1.scatter(P[0], P[1], P[2], c='blue', s=2, label='Source (P)')
+    ax1.scatter(Q[0], Q[1], Q[2], c='red', s=2, label='Target (Q)')
+    ax1.set_title("Before Registration")
+    ax1.legend()
+
+    # 2. 정합 후 (After Registration)
+    ax2 = fig.add_subplot(122, projection='3d')
+    ax2.scatter(P_transformed[0], P_transformed[1], P_transformed[2], c='blue', s=2, label='Transformed P')
+    ax2.scatter(Q[0], Q[1], Q[2], c='red', s=2, label='Target (Q)')
+    ax2.set_title("After Registration (GT)")
+    ax2.legend()
+
+    if vis:
+        plt.show()
+    
+    

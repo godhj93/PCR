@@ -1,4 +1,7 @@
-"""ModelNet40 dataset loader for point cloud registration."""
+"""
+Point Cloud Registration Dataset Loader
+Supports: ModelNet40, Stanford Bunny
+"""
 
 from __future__ import annotations
 
@@ -9,21 +12,33 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from scipy.spatial.transform import Rotation
-from typing import Tuple
+from typing import Tuple, Optional
 from pathlib import Path
+import open3d as o3d
+from utils.common import visualize_registration
+import matplotlib.pyplot as plt
 
 def load_modelnet40_data(partition: str = 'train') -> Tuple[np.ndarray, np.ndarray]:
     """Load ModelNet40 data from h5 files."""
+    # 데이터 경로 설정 (환경에 맞게 수정 필요)
     data_dir = Path(__file__).parent.parent / 'data'
     
     if not data_dir.exists():
-        raise ValueError(f"Data directory not found: {data_dir}")
-    
+        # Fallback for colab/local without specific structure
+        data_dir = Path('data') 
+
     all_data = []
     all_label = []
     
     pattern = os.path.join(data_dir, 'modelnet40_ply_hdf5_2048', f'ply_data_{partition}*.h5')
-    for h5_name in glob.glob(pattern):
+    files = glob.glob(pattern)
+    
+    if not files:
+        print(f"[Warning] No ModelNet40 files found in {pattern}")
+        # 빈 배열 반환하여 초기화 에러 방지 (실제 사용시에는 데이터 필요)
+        return np.zeros((1, 2048, 3)), np.zeros((1, 1))
+
+    for h5_name in files:
         with h5py.File(h5_name, 'r') as f:
             data = f['data'][:].astype('float32')
             label = f['label'][:].astype('int64')
@@ -36,6 +51,25 @@ def load_modelnet40_data(partition: str = 'train') -> Tuple[np.ndarray, np.ndarr
     return all_data, all_label
 
 
+def load_bunny_data(file_path: str = 'data/bunny/reconstruction/bun_zipper.ply') -> np.ndarray:
+    """Load Stanford Bunny as a normalized point cloud."""
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Bunny file not found: {file_path}")
+    
+    mesh = o3d.io.read_triangle_mesh(file_path)
+    mesh.compute_vertex_normals()
+    pcd = mesh.sample_points_poisson_disk(number_of_points=10000)
+    points = np.asarray(pcd.points)
+    
+    # Normalize to unit sphere
+    centroid = np.mean(points, axis=0)
+    points -= centroid
+    furthest_distance = np.max(np.sqrt(np.sum(points**2, axis=-1)))
+    points /= furthest_distance 
+    
+    return points.astype('float32')
+
+
 def jitter_pointcloud(pointcloud: np.ndarray, sigma: float = 0.01, clip: float = 0.05) -> np.ndarray:
     """Add random jitter to point cloud."""
     N, C = pointcloud.shape
@@ -43,34 +77,80 @@ def jitter_pointcloud(pointcloud: np.ndarray, sigma: float = 0.01, clip: float =
     return pointcloud
 
 
-class ModelNet40(Dataset):
-    def __init__(self, num_points, partition='train', gaussian_noise=False, unseen=False, factor=4):
+class RegistrationDataset(Dataset):
+    def __init__(self, 
+                 dataset_name: str,
+                 file_path: Optional[str] = None,  # Bunny 파일 경로
+                 num_points: int = 1024, 
+                 partition: str = 'train', 
+                 gaussian_noise: bool = False, 
+                 unseen: bool = False, 
+                 factor: float = 4):
         
-        self.data, self.label = load_modelnet40_data(partition)
+        self.dataset_name = dataset_name.lower()
         self.num_points = num_points
         self.partition = partition
         self.gaussian_noise = gaussian_noise
         self.unseen = unseen
-        self.label = self.label.squeeze()
         self.factor = factor
-        if self.unseen:
-            ######## simulate testing on first 20 categories while training on last 20 categories
-            if self.partition == 'test':
-                self.data = self.data[self.label>=20]
-                self.label = self.label[self.label>=20]
-            elif self.partition == 'train':
-                self.data = self.data[self.label<20]
-                self.label = self.label[self.label<20]
+
+        # ! Gravity 설정 (World frame에서의 중력 방향)
+        # ! 여기서는 z-축 음의 방향을 "중력"으로 정의 (예: g_world = (0, 0, -1))
+        # ! 실제 로봇/센서 설정에 맞춰 이 벡터를 바꾸면 됨.
+        
+        
+        if self.dataset_name == 'modelnet40':
+            self.gravity_world = np.array([0.0, 0.0, -1.0], dtype='float32')
+            self.data, self.label = load_modelnet40_data(partition)
+            self.label = self.label.squeeze()
+            
+            # Unseen categories split
+            if self.unseen:
+                if self.partition == 'test':
+                    self.data = self.data[self.label >= 20]
+                    self.label = self.label[self.label >= 20]
+                elif self.partition == 'train':
+                    self.data = self.data[self.label < 20]
+                    self.label = self.label[self.label < 20]
+                    
+        elif self.dataset_name == 'bunny':
+            self.gravity_world = np.array([0.0, -1.0, 0.0], dtype='float32')
+            print(f"Loading Bunny from {file_path}...")
+            self.bunny_points = load_bunny_data(file_path)
+            
+            # Bunny는 단일 객체이므로 Dataset 길이를 가상으로 설정
+            self.virtual_size = 10000 if partition == 'train' else 1000
+            
+        else:
+            raise ValueError(f"Unknown dataset name: {dataset_name}")
 
     def __getitem__(self, item):
-        pointcloud = self.data[item][:self.num_points]  # (N,3)
+        # 1. Point Cloud 데이터 가져오기
+        if self.dataset_name == 'modelnet40':
+            
+            pointcloud = self.data[item][:self.num_points]
+            
+        elif self.dataset_name == 'bunny':
+            
+            total_pts = self.bunny_points.shape[0]
+            
+            if self.partition == 'train':
+                idx = np.random.choice(total_pts, self.num_points, replace=False)
+            else:
+                # 테스트 시에는 결정론적 결과를 위해 시드 고정 후 샘플링
+                np.random.seed(item) 
+                idx = np.random.choice(total_pts, self.num_points, replace=False)
+            
+            pointcloud = self.bunny_points[idx]
+
+        # 2. Augmentation (Jitter)
         if self.gaussian_noise:
             pointcloud = jitter_pointcloud(pointcloud)
 
+        # 3. Random Rotation & Translation 생성
         if self.partition != 'train':
             np.random.seed(item)
 
-        # ----- 1) 랜덤 회전/이동 샘플링 -----
         anglex = np.random.uniform() * np.pi / self.factor
         angley = np.random.uniform() * np.pi / self.factor
         anglez = np.random.uniform() * np.pi / self.factor
@@ -79,14 +159,14 @@ class ModelNet40(Dataset):
         sinx, siny, sinz = np.sin(anglex), np.sin(angley), np.sin(anglez)
 
         Rx = np.array([[1, 0, 0],
-                    [0, cosx, -sinx],
-                    [0, sinx, cosx]])
+                       [0, cosx, -sinx],
+                       [0, sinx, cosx]])
         Ry = np.array([[cosy, 0, siny],
-                    [0, 1, 0],
-                    [-siny, 0, cosy]])
+                       [0, 1, 0],
+                       [-siny, 0, cosy]])
         Rz = np.array([[cosz, -sinz, 0],
-                    [sinz, cosz, 0],
-                    [0, 0, 1]])
+                       [sinz, cosz, 0],
+                       [0, 0, 1]])
         R_ab = Rx.dot(Ry).dot(Rz)
         R_ba = R_ab.T
 
@@ -97,69 +177,84 @@ class ModelNet40(Dataset):
         ])
         translation_ba = -R_ba.dot(translation_ab)
 
-        # ----- 2) 원본 순서에서 P0, Q0 만들기 (GT 1:1 대응) -----
-        # P0: (N,3), Q0: (N,3)
+        # 4. Source(P) & Target(Q) 생성
         P0 = pointcloud
-        rotation_ab = Rotation.from_euler('zyx', [anglez, angley, anglex])
-        Q0 = rotation_ab.apply(P0) + translation_ab[None, :]  # (N,3)
+        # 회전 적용: Q = R * P + t
+        Q0 = (R_ab @ P0.T).T + translation_ab[None, :]
 
         euler_ab = np.asarray([anglez, angley, anglex])
         euler_ba = -euler_ab[::-1]
 
+        # 5. Shuffle (Point Order Invariance 학습을 위해)
         N = self.num_points
-        orig_idx = np.arange(N)
-
-        # ----- 3) P, Q를 서로 독립적으로 섞되, perm을 저장 -----
         perm_p = np.random.permutation(N)
         perm_q = np.random.permutation(N)
 
-        # 섞인 점군 (모델이 보는 입력)
-        P = P0[perm_p]   # (N,3)
-        Q = Q0[perm_q]   # (N,3)
+        P = P0[perm_p]
+        Q = Q0[perm_q]
 
-        # ----- 4) GT correspondence 인덱스 쌍 (i, j) 만들기 -----
-        # P0[k] -> Q0[k]가 GT이므로,
-        #    P에서의 위치 i = perm_p^{-1}(k)
-        #    Q에서의 위치 j = perm_q^{-1}(k)
-        inv_perm_p = np.argsort(perm_p)  # shape (N,)
-        inv_perm_q = np.argsort(perm_q)  # shape (N,)
+        # 6. GT Correspondence 생성
+        inv_perm_p = np.argsort(perm_p)
+        inv_perm_q = np.argsort(perm_q)
+        corr = np.stack([inv_perm_p, inv_perm_q], axis=1).astype('int64')
 
-        # k-th 원본 점에 대한 (i_k, j_k) 쌍
-        corr = np.stack([inv_perm_p, inv_perm_q], axis=1).astype('int64')  # (N, 2)
+        # ! 7. 중력 방향 생성 (각 스캔의 센서 프레임에서의 gravity)
+        # ! 가정: P는 world frame과 정렬되어 있고, world에서의 중력은 self.gravity_world
+        # !       Q는 R_ab를 거친 frame이므로, g_Q = R_ab * g_world
+        g_p = self.gravity_world.astype('float32')                      # (3,)
+        g_q = (R_ab @ self.gravity_world).astype('float32')             # (3,)
 
         data = {
-            'p': P.T.astype('float32'),      # (3,N)
-            'q': Q.T.astype('float32'),      # (3,N)
+            'p': P.T.astype('float32'),      # (3, N)
+            'q': Q.T.astype('float32'),      # (3, N)
             'R_pq': R_ab.astype('float32'),
             't_pq': translation_ab.astype('float32'),
             'R_qp': R_ba.astype('float32'),
             't_qp': translation_ba.astype('float32'),
             'euler_pq': euler_ab.astype('float32'),
             'euler_qp': euler_ba.astype('float32'),
-
-            # ---- 여기부터 GT correspondence 관련 ----
-            # 각 row: [i, j]  (p의 인덱스 i, q의 인덱스 j 가 대응)
-            'corr_idx': corr,                # (N, 2), int64
-
-            # 옵션: 나중에 디버깅용으로 perm도 보고 싶으면
-            'perm_p': perm_p.astype('int64'),
-            'perm_q': perm_q.astype('int64'),
+            'corr_idx': corr,
+            # ! Gravity 정보 (네트워크 전처리에서 SO(2) 정렬에 사용)
+            'gravity_p': g_p,   # (3,)
+            'gravity_q': g_q,   # (3,)
         }
         return data
 
     def __len__(self):
-        return self.data.shape[0]
+        if self.dataset_name == 'modelnet40':
+            return self.data.shape[0]
+        elif self.dataset_name == 'bunny':
+            return self.virtual_size
+        return 0
+
 
 def data_loader(cfg):
+    # cfg.data.dataset_name에 따라 분기
+    dataset_name = getattr(cfg.data, 'dataset_name', 'modelnet40')
+    bunny_path = getattr(cfg.data, 'bunny_path', 'reconstruction/bun_zipper.ply')
     
+    train_dataset = RegistrationDataset(
+        dataset_name=dataset_name,
+        file_path=bunny_path,
+        num_points=cfg.data.num_points,
+        partition='train',
+        gaussian_noise=cfg.data.gaussian_noise,
+        unseen=cfg.data.unseen,
+        factor=cfg.data.factor
+    )
+    
+    test_dataset = RegistrationDataset(
+        dataset_name=dataset_name,
+        file_path=bunny_path,
+        num_points=cfg.data.num_points,
+        partition='test',
+        gaussian_noise=False,
+        unseen=cfg.data.unseen,
+        factor=cfg.data.factor
+    )
+
     train_loader = torch.utils.data.DataLoader(
-        ModelNet40(
-            num_points=cfg.data.num_points,
-            partition='train',
-            gaussian_noise=cfg.data.gaussian_noise,
-            unseen=cfg.data.unseen,
-            factor=cfg.data.factor
-        ),
+        train_dataset,
         batch_size=cfg.training.batch_size,
         shuffle=True,
         num_workers=cfg.data.num_workers,
@@ -167,13 +262,7 @@ def data_loader(cfg):
     )
     
     test_loader = torch.utils.data.DataLoader(
-        ModelNet40(
-            num_points=cfg.data.num_points,
-            partition='test',
-            gaussian_noise=False,
-            unseen=cfg.data.unseen,
-            factor=cfg.data.factor
-        ),
+        test_dataset,
         batch_size=cfg.training.batch_size,
         shuffle=False,
         num_workers=cfg.data.num_workers,
@@ -181,58 +270,222 @@ def data_loader(cfg):
     )
     
     return train_loader, test_loader
-    
+
+def draw_gravity_arrow(ax, origin, vector, color, label, scale=1.5):
+            """
+            scale: 1.5로 키워서 점군 밖으로 삐져나오게 함 (잘 보이도록)
+            linewidth: 3.0으로 굵게 설정
+            zorder: 10으로 설정하여 점들 위에 그려지게 함
+            """
+            # 벡터 정규화 및 스케일링
+            v_norm = vector / (np.linalg.norm(vector) + 1e-6) * scale
+            
+            x, y, z = origin
+            u, v, w = v_norm
+            
+            # 화살표 그리기 (굵고 진하게)
+            ax.quiver(x, y, z, u, v, w, color=color, length=1.0, normalize=False, 
+                      linewidth=3.0, arrow_length_ratio=0.2, zorder=100)
+            
+            # 텍스트 라벨 (약간 띄워서)
+            ax.text(x + u*1.1, y + v*1.1, z + w*1.1, label, color=color, 
+                    fontsize=12, fontweight='bold', zorder=101)
+            
+# --- Main Test Code ---
 if __name__ == '__main__':
-    dataset = ModelNet40(num_points=1024, partition='train', gaussian_noise=True)
+    import argparse
+    import sys
+    
+    # ICP 모듈 임포트
+    sys.path.append(str(Path(__file__).parent.parent / 'iterative_closet_point'))
+    from iterative_closet_point.bunny import run_icp, calculatenormal, build_kdtree
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset', type=str, default='bunny', choices=['modelnet40', 'bunny'])
+    parser.add_argument('--bunny_path', type=str, default='data/bunny/reconstruction/bun_zipper.ply')
+    parser.add_argument('--method', type=str, default='p2p', choices=['p2p', 'p2l', 'l2l'],
+                        help='ICP method: p2p (point-to-point), p2l (point-to-plane), l2l (plane-to-plane)')
+    parser.add_argument('--max_iter', type=int, default=50, help='Maximum ICP iterations')
+    parser.add_argument('--tol', type=float, default=1e-6, help='Convergence tolerance')
+    parser.add_argument('--dist_thresh', type=float, default=0.1, help='Distance threshold for matching')
+    args = parser.parse_args()
+
+    print(f"Testing RegistrationDataset with {args.dataset}...")
+    print(f"ICP Method: {args.method}")
+    
+    dataset = RegistrationDataset(
+        dataset_name=args.dataset, 
+        file_path=args.bunny_path, 
+        num_points=1024, 
+        partition='test'  # test로 변경하여 일관된 결과 확인
+    )
+    
     print(f'Dataset size: {len(dataset)}')
 
-    sample = dataset[0]
-    print('Sample keys:', sample.keys())
-    print('Pointcloud 1 shape:', sample['p'].shape)   # (3,N)
-    print('Pointcloud 2 shape:', sample['q'].shape)   # (3,N)
-    print('Rotation matrix shape:', sample['R_pq'].shape)
-    print('Translation vector shape:', sample['t_pq'].shape)
-    print('Euler angles shape:', sample['euler_pq'].shape)
-    print('Corr idx shape:', sample['corr_idx'].shape)
+    if len(dataset) > 0:
+        sample = dataset[0]
+        print('\n=== Sample Information ===')
+        print('Sample keys:', sample.keys())
+        print('P shape:', sample['p'].shape)
+        print('Q shape:', sample['q'].shape)
+        print('R shape:', sample['R_pq'].shape)
+        print('gravity_p:', sample['gravity_p'])
+        print('gravity_q:', sample['gravity_q'])
+        
+        # GT 정보
+        P = sample['p'].T  # (N, 3) for ICP
+        Q = sample['q'].T  # (N, 3) for ICP
+        R_gt = sample['R_pq']
+        t_gt = sample['t_pq']
+        corr = sample['corr_idx']
 
-    # ----- GT correspondence 체크 -----
-    P = sample['p']        # (3,N)
-    Q = sample['q']        # (3,N)
-    R = sample['R_pq']     # (3,3)
-    t = sample['t_pq']     # (3,)
-    corr = sample['corr_idx']  # (N,2)
+        # ! Gravity consistency check
+        g_p = sample['gravity_p']
+        g_q = sample['gravity_q']
+        g_q_pred = R_gt @ g_p
+        g_err = np.linalg.norm(g_q_pred - g_q)
+        print(f'Gravity Consistency Error: {g_err:.6f}')
 
-    N = P.shape[1]
+        # GT 검증
+        print('\n=== Ground Truth Validation ===')
+        idx_p, idx_q = corr[0]
+        p_point = sample['p'][:, idx_p]
+        q_point = sample['q'][:, idx_q]
+        q_pred = R_gt @ p_point + t_gt
+        
+        error = np.linalg.norm(q_pred - q_point)
+        print(f"GT Transformation Error (idx {idx_p}->{idx_q}): {error:.6f}")
+        
+        # Normals 계산 (method가 p2l 또는 l2l인 경우)
+        normals_P = None
+        normals_Q = None
+        if args.method in ['p2l', 'l2l']:
+            print("\nCalculating normals for point-to-plane/plane-to-plane ICP...")
+            normals_Q = calculatenormal(Q, k=20)
+            if args.method == 'l2l':
+                normals_P = calculatenormal(P, k=20)
+        
+        # ICP 실행
+        print(f'\n=== Running ICP ({args.method}) ===')
+        R_icp, t_icp, final_update = run_icp(
+            P=P,
+            Q=Q,
+            method=args.method,
+            normals_P=normals_P,
+            normals_Q=normals_Q,
+            max_iter=args.max_iter,
+            tol=args.tol,
+            dist_thresh=args.dist_thresh,
+            R_init=np.eye(3),
+            t_init=np.zeros((3, 1)),
+            verbose=True
+        )
+        
+        # ICP 결과와 GT 비교
+        print('\n=== ICP Results vs Ground Truth ===')
+        print('Estimated R:\n', R_icp)
+        print('Ground Truth R:\n', R_gt)
+        print('\nEstimated t:', t_icp.ravel())
+        print('Ground Truth t:', t_gt)
+        
+        # 회전 오차 (Frobenius norm of difference)
+        R_error = np.linalg.norm(R_icp - R_gt, 'fro')
+        print(f'\nRotation Error (Frobenius): {R_error:.6f}')
+        
+        # 회전 오차 (각도)
+        R_diff = R_icp.T @ R_gt
+        trace = np.trace(R_diff)
+        # 수치 안정성을 위해 clipping
+        trace_clamped = np.clip((trace - 1) / 2, -1.0, 1.0)
+        angle_error_rad = np.arccos(trace_clamped)
+        angle_error_deg = np.degrees(angle_error_rad)
+        print(f'Rotation Error (angle): {angle_error_deg:.4f} degrees')
+        
+        # 평행이동 오차
+        t_error = np.linalg.norm(t_icp.ravel() - t_gt)
+        print(f'Translation Error (L2): {t_error:.6f}')
+        
+        # 포인트별 평균 오차 계산
+        P_transformed_gt = (R_gt @ sample['p'] + t_gt[:, None]).T  # (N, 3)
+        P_transformed_icp = (R_icp @ sample['p'] + t_icp.ravel()[:, None]).T  # (N, 3)
+        
+        point_errors = np.linalg.norm(P_transformed_icp - P_transformed_gt, axis=1)
+        mean_point_error = np.mean(point_errors)
+        max_point_error = np.max(point_errors)
+        print(f'\nMean Point Error: {mean_point_error:.6f}')
+        print(f'Max Point Error: {max_point_error:.6f}')
+        
+        # 시각화
+        print("\n=== Visualizations ===")
+        print("1. Ground Truth Registration")
+        visualize_registration(sample['p'], sample['q'], R_gt, t_gt, vis=False,
+                             title=f"{args.dataset} - Ground Truth Registration")
+        
+        print("2. ICP Registration")
+        visualize_registration(sample['p'], sample['q'], R_icp, t_icp.ravel(), vis=False, 
+                             title=f"{args.dataset} - ICP ({args.method}) Registration")
+        
+        # --- 시각화 및 저장 (GUI 없음) ---
+        print("\n=== Generating Visualization (No GUI) ===")
+        
+        fig = plt.figure(figsize=(18, 10))
+        
+        # 화살표 시작점 (점군의 중심)
+        center_p = np.mean(sample['p'], axis=1)
+        center_q = np.mean(sample['q'], axis=1)
+        
+        # [1] Before Registration
+        ax1 = fig.add_subplot(131, projection='3d')
+        # 점들을 좀 더 흐리게(alpha=0.3) 하고 작게(s=1) 해서 화살표 강조
+        ax1.scatter(sample['p'][0], sample['p'][1], sample['p'][2], c='blue', s=1, alpha=0.3, label='Source (P)')
+        ax1.scatter(sample['q'][0], sample['q'][1], sample['q'][2], c='red', s=1, alpha=0.3, label='Target (Q)')
+        
+        # P는 검은색, Q는 빨간색 화살표 (대비 강조)
+        draw_gravity_arrow(ax1, center_p, sample['gravity_p'], 'black', 'g_P')
+        draw_gravity_arrow(ax1, center_q, sample['gravity_q'], 'red', 'g_Q')
+        
+        ax1.set_title("1. Before Registration")
+        ax1.legend()
+        
+        # [2] GT Alignment
+        ax2 = fig.add_subplot(132, projection='3d')
+        P_gt_vis = (R_gt @ sample['p'] + t_gt[:, None])
+        center_p_gt = np.mean(P_gt_vis, axis=1)
+        g_p_aligned_gt = R_gt @ sample['gravity_p']
+        
+        ax2.scatter(P_gt_vis[0], P_gt_vis[1], P_gt_vis[2], c='green', s=1, alpha=0.3, label='P (GT)')
+        ax2.scatter(sample['q'][0], sample['q'][1], sample['q'][2], c='red', s=1, alpha=0.3, label='Q')
+        
+        draw_gravity_arrow(ax2, center_p_gt, g_p_aligned_gt, 'green', 'g_P(GT)')
+        draw_gravity_arrow(ax2, center_q, sample['gravity_q'], 'red', 'g_Q')
+        
+        ax2.set_title("2. GT Registration")
+        ax2.legend()
+        
+        # [3] ICP Alignment
+        ax3 = fig.add_subplot(133, projection='3d')
+        P_icp_vis = (R_icp @ sample['p'] + t_icp.ravel()[:, None])
+        center_p_icp = np.mean(P_icp_vis, axis=1)
+        g_p_aligned_icp = R_icp @ sample['gravity_p']
+        
+        ax3.scatter(P_icp_vis[0], P_icp_vis[1], P_icp_vis[2], c='cyan', s=1, alpha=0.3, label='P (ICP)')
+        ax3.scatter(sample['q'][0], sample['q'][1], sample['q'][2], c='red', s=1, alpha=0.3, label='Q')
+        
+        draw_gravity_arrow(ax3, center_p_icp, g_p_aligned_icp, 'cyan', 'g_P(ICP)')
+        draw_gravity_arrow(ax3, center_q, sample['gravity_q'], 'red', 'g_Q')
+        
+        ax3.set_title(f"3. ICP Registration ({args.method})")
+        ax3.legend()
+        
+        # 저장
+        save_path = f'runs/icp_vis_gravity_{args.dataset}_{args.method}.png'
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        
+        plt.tight_layout()
+        plt.show()
+        plt.savefig(save_path, dpi=150) # 해상도 높임
+        print(f"Visualization saved to: {save_path}")
+        plt.close(fig) # 메모리 해제
 
-    # 몇 개만 찍어보는 sanity check
-    print("\n[Sanity check] First 5 correspondences:")
-    for k in range(5):
-        i, j = corr[k]
-        p_i = P[:, i]              # (3,)
-        q_j = Q[:, j]              # (3,)
-        q_pred = R @ p_i + t       # (3,)
-
-        err = np.linalg.norm(q_pred - q_j)
-        print(f"k={k}, i={i}, j={j}, error={err:.6e}")
-
-    # 전체 correspondence error 통계
-    errs = []
-    for k in range(N):
-        i, j = corr[k]
-        p_i = P[:, i]
-        q_j = Q[:, j]
-        q_pred = R @ p_i + t
-        errs.append(np.linalg.norm(q_pred - q_j))
-
-    errs = np.array(errs)
-    print("\n[Global correspondence error]")
-    print(f"mean = {errs.mean():.6e}")
-    print(f"max  = {errs.max():.6e}")
-    print(f"min  = {errs.min():.6e}")
-
-    # 인덱스 중복/누락 여부 체크 (full overlap인 경우)
-    unique_p = np.unique(corr[:, 0])
-    unique_q = np.unique(corr[:, 1])
-    print("\n[Index coverage]")
-    print(f"unique p indices: {len(unique_p)} / {N}")
-    print(f"unique q indices: {len(unique_q)} / {N}")
+    else:
+        print("Dataset is empty.")
