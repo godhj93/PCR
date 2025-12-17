@@ -143,10 +143,6 @@ class RegistrationDataset(Dataset):
             
             pointcloud = self.bunny_points[idx]
 
-        # 2. Augmentation (Jitter)
-        if self.gaussian_noise:
-            pointcloud = jitter_pointcloud(pointcloud)
-
         # 3. Random Rotation & Translation 생성
         if self.partition != 'train':
             np.random.seed(item)
@@ -182,6 +178,10 @@ class RegistrationDataset(Dataset):
         # 회전 적용: Q = R * P + t
         Q0 = (R_ab @ P0.T).T + translation_ab[None, :]
 
+        if self.gaussian_noise:
+            P0 = jitter_pointcloud(P0)
+            Q0 = jitter_pointcloud(Q0)
+            
         euler_ab = np.asarray([anglez, angley, anglex])
         euler_ba = -euler_ab[::-1]
 
