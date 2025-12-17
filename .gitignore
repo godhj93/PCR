@@ -1,5 +1,8 @@
+vnn_pc/
 runs/
-
+data/
+*.ply
+iterative_closet_point/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
