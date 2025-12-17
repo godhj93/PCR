@@ -1,15 +1,14 @@
 hydra:
   run:
-    dir: runs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: runs/${data.dataset_name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
 
 model:
-  _target_: utils.model.FLOW
-  c_dim: 128
-
+  _target_: utils.model.ProbabilisticGravityModel
+  pooling: max
 device: cuda:0
 
 training:
-  batch_size: 64
+  batch_size: 32
   epochs: 300
 
 test:
@@ -19,12 +18,17 @@ test:
   vis_count: 10
 
 data:
-  num_points: 2048
+  dataset_name: bunny
+  bunny_path: data/bunny/reconstruction/bun_zipper.ply
+  num_points: 1024
   gaussian_noise: 0.01
   unseen: false
   factor: 4
   num_workers: 8
   
+loss:
+  _target_: utils.loss.VMFLoss
+
 optimizer:
   name: sgd
   lr: 1e-3

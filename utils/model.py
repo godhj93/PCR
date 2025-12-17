@@ -2,8 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from utils.pointnet_vn import PointNetEncoder
-from utils.layers import VNLinearLeakyReLU, VNLinear 
+from utils.layers import VNLinearLeakyReLU, VNLinear, VNInvariant
 import numpy as np
+
 
 class GravityEstimationModel(nn.Module):
     def __init__(self, pooling, normal_channel=True):
@@ -45,7 +46,47 @@ class GravityEstimationModel(nn.Module):
         return g_pred
 
 
+class ProbabilisticGravityModel(GravityEstimationModel):
+    def __init__(self, pooling, normal_channel=True):
+        super(ProbabilisticGravityModel, self).__init__(pooling, normal_channel)
+        
+        self.vn_invariant = VNInvariant(128) # 벡터(128,3) -> 스칼라(128)
+        
+        self.kappa_mlp = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.LeakyReLU(0.2),
+            nn.Linear(64, 1),
+            nn.Softplus() # Kappa는 무조건 양수 (+)
+        )
 
+    def forward(self, x):
+        
+        # 1. Backbone & Shared Layers 
+        x = self.feat(x)       # (B, 1024, 3)
+        x = self.vn_fc1(x)
+        x = self.vn_fc2(x)   
+        
+        # -----------------------------------------------------------
+        # [Branch 1] Mu (방향) 예측 
+        # -----------------------------------------------------------
+        mu = self.vn_fc3(x)    # (B, 1, 3)
+        mu = mu.view(-1, 3)    # (B, 3)
+        mu = F.normalize(mu, p=2, dim=1) # Unit Sphere 정규화
+        
+        # -----------------------------------------------------------
+        # [Branch 2] Kappa (확신도) 예측 - 새로 만든 레이어 사용
+        # -----------------------------------------------------------
+        # Invariant Layer: 벡터의 '길이' 정보만 추출 (회전 불변)
+        x_inv = self.vn_invariant(x)   # (B, 128)
+        
+        # MLP 통과
+        kappa = self.kappa_mlp(x_inv)  # (B, 1)
+        
+        # 수치 안정성을 위한 최소값 보장 (+1.0 bias)
+        kappa = kappa + 1.0
+        
+        return mu, kappa
+    
 if __name__ == '__main__':
     
     # Check Equivariance of PointNetEncoder

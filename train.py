@@ -10,7 +10,8 @@ import torch.nn as nn
 import torch
 from torch.utils.tensorboard import SummaryWriter
 from utils.data import data_loader
-from utils.utils import train_one_epoch
+from utils.common import train_one_epoch, AverageMeter, count_parameters
+from termcolor import colored
 
 log = logging.getLogger(__name__)
 
@@ -35,35 +36,42 @@ def train(cfg: DictConfig) -> None:
     # Load data and model
     train_loader, test_loader = data_loader(cfg)
     model = hydra.utils.instantiate(cfg.model).to(cfg.device)
+    log.info(f"Model Parameters: {count_parameters(model):,}")
     
     optimizer = torch.optim.SGD(model.parameters(), lr=cfg.optimizer.lr)
-    loss_fn = nn.MSELoss()
+    loss_fn = hydra.utils.instantiate(cfg.loss)
     
     log.info("===== Training Start =====")
     pbar = tqdm(range(1, cfg.training.epochs + 1), desc="Training Epochs")
     
+    AvgMeter_train = AverageMeter()
+    AvgMeter_val = AverageMeter()
     best_loss = float('inf')
     
     for epoch in pbar:
-        # 가상의 loss 계산
         
-        loss, acc = train_one_epoch(model = model, 
-                        train_loader = train_loader,
+        AvgMeter_train.reset()
+        AvgMeter_val.reset()
+        
+        result = train_one_epoch(model = model, 
+                        data_loader= {'train': train_loader, 'test': test_loader},
                         optimizer = optimizer,
                         loss_fn = loss_fn,
                         epoch = epoch,
+                        metric = {'train': AvgMeter_train, 'val': AvgMeter_val},
                         cfg = cfg)
         
-        # TensorBoard에 loss 기록
-        writer.add_scalar("Loss/train", loss['train_loss'], epoch)
-        writer.add_scalar("Loss/test", loss['test_loss'], epoch)
+        train_loss = result['train_loss']
+        val_loss = result['val_loss']
+        
+        writer.add_scalar("Loss/train", train_loss, epoch)
+        writer.add_scalar("Loss/test", val_loss, epoch)
         writer.add_scalar("Learning_Rate", optimizer.param_groups[0]['lr'], epoch)
-        writer.add_scalar("Accuracy/test", acc, epoch)
-        log.info(f"Epoch [{epoch}/{cfg.training.epochs}] - Train Loss: {loss['train_loss']:.4f}, Test Loss: {loss['test_loss']:.4f}, Test Acc: {acc:.4f}")
+        log.info(colored(f"Epoch [{epoch}/{cfg.training.epochs}] - Train Loss: {train_loss:.4f}, Test Loss: {val_loss:.4f}", "cyan"))
 
         # save checkpoint
-        if loss['test_loss'] < best_loss:
-            best_loss = loss['test_loss']
+        if val_loss < best_loss:
+            best_loss = val_loss
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -74,7 +82,6 @@ def train(cfg: DictConfig) -> None:
         
     writer.close()
     log.info("===== Training End =====")
-
 
 if __name__ == "__main__":
     

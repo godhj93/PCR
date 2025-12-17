@@ -12,20 +12,25 @@ class STNkd(nn.Module):
     def __init__(self, pooling, d=64):
         super(STNkd, self).__init__()
         self.pooling = pooling
-        
-        self.conv1 = VNLinearLeakyReLU(d, 64//3, dim=4, negative_slope=0.0)
-        self.conv2 = VNLinearLeakyReLU(64//3, 128//3, dim=4, negative_slope=0.0)
-        self.conv3 = VNLinearLeakyReLU(128//3, 1024//3, dim=4, negative_slope=0.0)
+        small = False
+        if small:
+            denominator = 3
+        else:
+            denominator = 1
+            
+        self.conv1 = VNLinearLeakyReLU(d, 64//denominator, dim=4, negative_slope=0.0)
+        self.conv2 = VNLinearLeakyReLU(64//denominator, 128//denominator, dim=4, negative_slope=0.0)
+        self.conv3 = VNLinearLeakyReLU(128//denominator, 1024//denominator, dim=4, negative_slope=0.0)
 
-        self.fc1 = VNLinearLeakyReLU(1024//3, 512//3, dim=3, negative_slope=0.0)
-        self.fc2 = VNLinearLeakyReLU(512//3, 256//3, dim=3, negative_slope=0.0)
+        self.fc1 = VNLinearLeakyReLU(1024//denominator, 512//denominator, dim=3, negative_slope=0.0)
+        self.fc2 = VNLinearLeakyReLU(512//denominator, 256//denominator, dim=3, negative_slope=0.0)
         
         if self.pooling == 'max':
-            self.pool = VNMaxPool(1024//3)
+            self.pool = VNMaxPool(1024//denominator)
         elif self.pooling == 'mean':
             self.pool = mean_pool
         
-        self.fc3 = VNLinear(256//3, d)
+        self.fc3 = VNLinear(256//denominator, d)
         self.d = d
 
     def forward(self, x):
@@ -89,37 +94,37 @@ class PointNetEncoder(nn.Module):
         
         return x
         
-    def old_forward(self, x):
-        B, D, N = x.size()
+    # def old_forward(self, x):
+    #     B, D, N = x.size()
         
-        x = x.unsqueeze(1)
-        feat = get_graph_feature_cross(x, k=self.n_knn)
-        x = self.conv_pos(feat)
-        x = self.pool(x)
+    #     x = x.unsqueeze(1)
+    #     feat = get_graph_feature_cross(x, k=self.n_knn)
+    #     x = self.conv_pos(feat)
+    #     x = self.pool(x)
         
-        x = self.conv1(x)
+    #     x = self.conv1(x)
         
-        if self.feature_transform:
-            x_global = self.fstn(x).unsqueeze(-1).repeat(1,1,1,N)
-            x = torch.cat((x, x_global), 1)
+    #     if self.feature_transform:
+    #         x_global = self.fstn(x).unsqueeze(-1).repeat(1,1,1,N)
+    #         x = torch.cat((x, x_global), 1)
         
-        pointfeat = x
-        x = self.conv2(x)
-        x = self.bn3(self.conv3(x))
+    #     pointfeat = x
+    #     x = self.conv2(x)
+    #     x = self.bn3(self.conv3(x))
         
-        x_mean = x.mean(dim=-1, keepdim=True).expand(x.size())
-        x = torch.cat((x, x_mean), 1)
-        x, trans = self.std_feature(x)
-        x = x.view(B, -1, N)
+    #     x_mean = x.mean(dim=-1, keepdim=True).expand(x.size())
+    #     x = torch.cat((x, x_mean), 1)
+    #     x, trans = self.std_feature(x)
+    #     x = x.view(B, -1, N)
         
-        x = torch.max(x, -1, keepdim=False)[0]
+    #     x = torch.max(x, -1, keepdim=False)[0]
         
-        trans_feat = None
-        if self.global_feat:
-            return x, trans, trans_feat
-        else:
-            x = x.view(-1, 1024, 1).repeat(1, 1, N)
-            return torch.cat([x, pointfeat], 1), trans, trans_feat
+    #     trans_feat = None
+    #     if self.global_feat:
+    #         return x, trans, trans_feat
+    #     else:
+    #         x = x.view(-1, 1024, 1).repeat(1, 1, N)
+    #         return torch.cat([x, pointfeat], 1), trans, trans_feat
 
 if __name__ == '__main__':
     

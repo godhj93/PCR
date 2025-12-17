@@ -234,3 +234,11 @@ class VNStdFeature(nn.Module):
             x_std = torch.einsum('bijmn,bjkmn->bikmn', x, z0)
         
         return x_std, z0
+    
+class VNInvariant(nn.Module):
+    def __init__(self, in_channels):
+        super(VNInvariant, self).__init__()
+    
+    def forward(self, x):
+        # x: (B, C, 3) -> Norm -> (B, C)
+        return torch.norm(x, dim=-1)

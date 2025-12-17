@@ -100,7 +100,7 @@ class RegistrationDataset(Dataset):
         
         
         if self.dataset_name == 'modelnet40':
-            self.gravity_world = np.array([0.0, 0.0, -1.0], dtype='float32')
+            self.gravity_world = np.array([0.0, -1.0, 0.0], dtype='float32')
             self.data, self.label = load_modelnet40_data(partition)
             self.label = self.label.squeeze()
             
@@ -143,6 +143,13 @@ class RegistrationDataset(Dataset):
             
             pointcloud = self.bunny_points[idx]
 
+        # Normalize Point Cloud
+        centroid = np.mean(pointcloud, axis=0)
+        pointcloud = pointcloud - centroid
+        
+        max_dist = np.max(np.sqrt(np.sum(pointcloud**2, axis=1)))
+        pointcloud = pointcloud / (max_dist + 1e-8)
+        
         # 3. Random Rotation & Translation 생성
         if self.partition != 'train':
             np.random.seed(item)
@@ -482,7 +489,7 @@ if __name__ == '__main__':
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         
         plt.tight_layout()
-        plt.show()
+        # plt.show()
         plt.savefig(save_path, dpi=150) # 해상도 높임
         print(f"Visualization saved to: {save_path}")
         plt.close(fig) # 메모리 해제
