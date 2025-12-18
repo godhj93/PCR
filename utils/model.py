@@ -2,135 +2,166 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from utils.pointnet_vn import PointNetEncoder
+from utils.dgcnn_vn import VN_DGCNN_Encoder
 from utils.layers import VNLinearLeakyReLU, VNLinear, VNInvariant
 import numpy as np
 
 
-class GravityEstimationModel(nn.Module):
+class PointNet_VN_Gravity(nn.Module):
     def __init__(self, pooling, normal_channel=True):
-        super(GravityEstimationModel, self).__init__()
+        super(PointNet_VN_Gravity, self).__init__()
         self.pooling = pooling
         channel = 6 if normal_channel else 3
         
-        # 1. VN Encoder (Backbone)
-        # global_feat=True -> (B, 1024, 3) 형태의 Equivariant Feature가 나온다고 가정
+        # PointNetEncoder는 보통 1024//3 = 341 채널을 반환한다고 가정
         self.feat = PointNetEncoder(self.pooling, global_feat=True, feature_transform=True, channel=channel)
         
-        # 2. Regression Head
-        # (B, 1024, 3) -> (B, 512, 3)
-        self.vn_fc1 = VNLinearLeakyReLU(1024//3, 512, dim=3) # dim=3은 3D vector라는 뜻
-        
-        # (B, 512, 3) -> (B, 128, 3)
+        # (B, 341, 3) -> (B, 512, 3)
+        self.vn_fc1 = VNLinearLeakyReLU(1024//3, 512, dim=3)
         self.vn_fc2 = VNLinearLeakyReLU(512, 128, dim=3)
-        
-        # (B, 128, 3) -> (B, 1, 3) -> 최종 벡터 1개 추출
-        # 마지막은 Activation 없이 선형 변환만 (Rotation만 허용)
         self.vn_fc3 = VNLinear(128, 1) 
 
     def forward(self, x):
-        # x: (B, C, N)
-        # feat: (B, 1024, 3) <- VN Encoder의 출력 (Global Feature)
         x = self.feat(x)
-        
-        # Head 통과
         x = self.vn_fc1(x)
         x = self.vn_fc2(x)
-        x = self.vn_fc3(x) # (B, 1, 3)
-        
-        # 차원 축소: (B, 1, 3) -> (B, 3)
+        x = self.vn_fc3(x)
         g_pred = x.view(-1, 3)
-        
-        # Unit Vector로 정규화 (중력'방향'만 중요하므로)
         g_pred = F.normalize(g_pred, p=2, dim=1)
-        
         return g_pred
 
 
-class ProbabilisticGravityModel(GravityEstimationModel):
+class PointNet_VN_Gravity_Bayes(PointNet_VN_Gravity):
     def __init__(self, pooling, normal_channel=True):
-        super(ProbabilisticGravityModel, self).__init__(pooling, normal_channel)
+        super(PointNet_VN_Gravity_Bayes, self).__init__(pooling, normal_channel)
         
-        self.vn_invariant = VNInvariant(128) # 벡터(128,3) -> 스칼라(128)
-        
+        self.vn_invariant = VNInvariant(128)
         self.kappa_mlp = nn.Sequential(
             nn.Linear(128, 64),
             nn.LeakyReLU(0.2),
             nn.Linear(64, 1),
-            nn.Softplus() # Kappa는 무조건 양수 (+)
+            nn.Softplus()
         )
 
     def forward(self, x):
-        
-        # 1. Backbone & Shared Layers 
-        x = self.feat(x)       # (B, 1024, 3)
+        x = self.feat(x)
         x = self.vn_fc1(x)
-        x = self.vn_fc2(x)   
+        x = self.vn_fc2(x)
         
-        # -----------------------------------------------------------
-        # [Branch 1] Mu (방향) 예측 
-        # -----------------------------------------------------------
-        mu = self.vn_fc3(x)    # (B, 1, 3)
-        mu = mu.view(-1, 3)    # (B, 3)
-        mu = F.normalize(mu, p=2, dim=1) # Unit Sphere 정규화
+        # Mu Branch
+        mu = self.vn_fc3(x)
+        mu = mu.view(-1, 3)
+        mu = F.normalize(mu, p=2, dim=1)
         
-        # -----------------------------------------------------------
-        # [Branch 2] Kappa (확신도) 예측 - 새로 만든 레이어 사용
-        # -----------------------------------------------------------
-        # Invariant Layer: 벡터의 '길이' 정보만 추출 (회전 불변)
-        x_inv = self.vn_invariant(x)   # (B, 128)
+        # Kappa Branch
+        x_inv = self.vn_invariant(x)
+        kappa = self.kappa_mlp(x_inv)
+        kappa = kappa + 1.0
         
-        # MLP 통과
-        kappa = self.kappa_mlp(x_inv)  # (B, 1)
+        return mu, kappa
+    
+class DGCNN_VN_Gravity(nn.Module):
+    def __init__(self, k=20, normal_channel=False):
+        super(DGCNN_VN_Gravity, self).__init__()
         
-        # 수치 안정성을 위한 최소값 보장 (+1.0 bias)
+        # 1. VN DGCNN Encoder
+        self.feat = VN_DGCNN_Encoder(k=k, embed_dim=1024)
+        
+        # [수정] 에러 로그에 따르면 Encoder 출력은 1024 채널입니다.
+        # (30x1024 input error implies last dim is 1024)
+        encoder_dim = 1024 
+        
+        # 2. Regression Head
+        self.vn_fc1 = VNLinearLeakyReLU(encoder_dim, 512, dim=3)
+        self.vn_fc2 = VNLinearLeakyReLU(512, 128, dim=3)
+        self.vn_fc3 = VNLinear(128, 1) 
+
+    def forward(self, x):
+        # Input Handling (XYZ only)
+        if x.size(1) > 3:
+            x = x[:, :3, :]
+            
+        x = self.feat(x)       # (B, 1024, 3)
+        x = self.vn_fc1(x)     # (B, 512, 3)
+        x = self.vn_fc2(x)     # (B, 128, 3)
+        x = self.vn_fc3(x)     # (B, 1, 3)
+        
+        g_pred = x.view(-1, 3)
+        g_pred = F.normalize(g_pred, p=2, dim=1)
+        
+        return g_pred
+
+class DGCNN_VN_Gravity_Bayes(DGCNN_VN_Gravity):
+    def __init__(self, k=20, normal_channel=False):
+        super(DGCNN_VN_Gravity_Bayes, self).__init__(k, normal_channel)
+        
+        self.vn_invariant = VNInvariant(128) 
+        self.kappa_mlp = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.LeakyReLU(0.2),
+            nn.Linear(64, 1),
+            nn.Softplus()
+        )
+
+    def forward(self, x):
+        if x.size(1) > 3:
+            x = x[:, :3, :]
+
+        # Backbone
+        x = self.feat(x)
+        x = self.vn_fc1(x)
+        x = self.vn_fc2(x)
+        
+        # Mu Branch
+        mu = self.vn_fc3(x)
+        mu = mu.view(-1, 3)
+        mu = F.normalize(mu, p=2, dim=1)
+        
+        # Kappa Branch
+        x_inv = self.vn_invariant(x)
+        kappa = self.kappa_mlp(x_inv)
         kappa = kappa + 1.0
         
         return mu, kappa
     
 if __name__ == '__main__':
     
-    # Check Equivariance of PointNetEncoder
-    # [수정] N(점 개수)과 C(채널/좌표)를 올바르게 설정
-    # (Batch, Channel=3, Num_Points=30)
+    # 1. Setup Data
     B, C, N = 10, 3, 30 
-    
-    # Generate random point cloud: (1, 3, 30)
     points = torch.randn(B, C, N)
-    print("Input Points Shape:", points.shape) # (1, 3, 30) 확인
+    print("Input Points Shape:", points.shape)
     
-    # Rotate point cloud
-    # 회전은 (3, 3) 행렬이므로 채널 차원(dim=1)에 대해 곱해야 함
-    theta = np.pi / 4  # 45 degrees
+    # 2. Rotate
+    theta = np.pi / 4
     rotation_matrix = torch.tensor([
         [np.cos(theta), -np.sin(theta), 0],
         [np.sin(theta),  np.cos(theta), 0],
         [0,              0,             1]
     ], dtype=torch.float32)
     
-    # (3, 3) x (1, 3, 30) -> (1, 3, 30)
-    # einsum을 쓰거나 transpose 후 matmul 사용
-    # 간단하게 구현:
     rotated_points = torch.matmul(rotation_matrix, points) 
-    
     print("Rotated Points Shape:", rotated_points.shape)
     
-    # 모델 생성 (기존 코드와 동일)
-    model = GravityEstimationModel(pooling='max', normal_channel=False)
+    # 3. Model Init
+    print("Initializing Model...")
+    model = DGCNN_VN_Gravity_Bayes(k=20, normal_channel=False)
+    model.eval()
     
-    # 추론
-    pred1 = model(points)          # f(x)
-    pred2 = model(rotated_points)  # f(R * x)
+    # 4. Inference & Validation
+    with torch.no_grad():
+        # [수정] 모델이 Tuple (mu, kappa)를 반환하므로 unpacking 필요
+        mu1, kappa1 = model(points)
+        mu2, kappa2 = model(rotated_points)
     
-    # 검증: f(R * x) == R * f(x) 이어야 함 (Equivariance)
-    # pred1(결과 벡터)도 회전시켜서 pred2와 비교해야 함
+    # [수정] Equivariance 체크는 방향 벡터(mu)에 대해서만 수행
+    # mu1을 회전시킨 것과 mu2가 같아야 함
+    mu1_rotated = mu1 @ rotation_matrix.T 
     
-    # [주의] pred1의 shape은 (B, C_out, 3) 일 것임 (GravityEncoder 수정본 기준)
-    # 따라서 pred1의 마지막 차원(3)에 대해 회전을 적용해야 함
+    loss = F.mse_loss(mu2, mu1_rotated)
+    print(f"Equivariance Loss (Mu): {loss.item():.6f}")
     
-    pred1_rotated = pred1 @ rotation_matrix.T  # (B, C, 3) x (3, 3)
+    # Kappa는 Invariant 해야 함 (회전해도 불확실성은 같아야 함)
+    kappa_loss = F.mse_loss(kappa1, kappa2)
+    print(f"Invariance Loss (Kappa): {kappa_loss.item():.6f}")
     
-    loss = F.mse_loss(pred2, pred1_rotated)
-    print("Equivariance Loss:", loss.item())
-    
-    print("Output Shape:", pred1.shape)
-    
+    print("Output Shape (Mu):", mu1.shape)

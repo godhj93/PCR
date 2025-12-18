@@ -1,10 +1,18 @@
+defaults:
+  - _self_
+  - model: dgcnn
+  # 선택된 모델 이름을 가져오기 위한 트릭
+  - override hydra/job_logging: default
+  - override hydra/hydra_logging: default
+
+# 아래처럼 model_name을 명시적으로 관리하거나, model 변수를 직접 수정합니다.
+model_name: ${hydra:runtime.choices.model}
+
 hydra:
   run:
-    dir: runs/${data.dataset_name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    # ${model} 대신 ${model_name}을 사용합니다.
+    dir: runs/${data.name}/${now:%Y-%m-%d}/${model_name}_${now:%Y-%m-%d-%H-%M-%S}/
 
-model:
-  _target_: utils.model.ProbabilisticGravityModel
-  pooling: max
 device: cuda:0
 
 training:
@@ -18,7 +26,7 @@ test:
   vis_count: 10
 
 data:
-  dataset_name: bunny
+  name: bunny
   bunny_path: data/bunny/reconstruction/bun_zipper.ply
   num_points: 1024
   gaussian_noise: 0.01
@@ -32,8 +40,7 @@ loss:
 optimizer:
   name: sgd
   lr: 1e-3
-  weight_decay: 1e-5
+  weight_decay: 1e-4
   momentum: true
   nesterov: false
   use_scheduler: true
-  scheduler: false
