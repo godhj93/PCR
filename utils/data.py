@@ -80,7 +80,8 @@ def jitter_pointcloud(pointcloud: np.ndarray, sigma: float = 0.01, clip: float =
 class RegistrationDataset(Dataset):
     def __init__(self, 
                  dataset_name: str,
-                 file_path: Optional[str] = None,  # Bunny 파일 경로
+                 data_source = None,  # 외부에서 로드된 데이터를 받음 (공유)
+                 file_path: Optional[str] = None,  # Bunny 파일 경로 (backward compatibility)
                  num_points: int = 1024, 
                  partition: str = 'train', 
                  gaussian_noise: bool = False, 
@@ -101,7 +102,8 @@ class RegistrationDataset(Dataset):
         
         if self.dataset_name == 'modelnet40':
             self.gravity_world = np.array([0.0, -1.0, 0.0], dtype='float32')
-            self.data, self.label = load_modelnet40_data(partition)
+            
+            self.data, self.label = data_source
             self.label = self.label.squeeze()
             
             # Unseen categories split
@@ -115,8 +117,8 @@ class RegistrationDataset(Dataset):
                     
         elif self.dataset_name == 'bunny':
             self.gravity_world = np.array([0.0, -1.0, 0.0], dtype='float32')
-            print(f"Loading Bunny from {file_path}...")
-            self.bunny_points = load_bunny_data(file_path)
+            
+            self.bunny_points = data_source
             
             # Bunny는 단일 객체이므로 Dataset 길이를 가상으로 설정
             self.virtual_size = 10000 if partition == 'train' else 1000
@@ -240,25 +242,61 @@ def data_loader(cfg):
     dataset_name = getattr(cfg.data, 'dataset_name', 'modelnet40')
     bunny_path = getattr(cfg.data, 'bunny_path', 'reconstruction/bun_zipper.ply')
     
-    train_dataset = RegistrationDataset(
-        dataset_name=dataset_name,
-        file_path=bunny_path,
-        num_points=cfg.data.num_points,
-        partition='train',
-        gaussian_noise=cfg.data.gaussian_noise,
-        unseen=cfg.data.unseen,
-        factor=cfg.data.factor
-    )
+    # 데이터 한 번만 로드 (train과 test에서 공유)
+    shared_data = None
     
-    test_dataset = RegistrationDataset(
-        dataset_name=dataset_name,
-        file_path=bunny_path,
-        num_points=cfg.data.num_points,
-        partition='test',
-        gaussian_noise=False,
-        unseen=cfg.data.unseen,
-        factor=cfg.data.factor
-    )
+    if dataset_name.lower() == 'modelnet40':
+        print("Loading ModelNet40 data...")
+        # ModelNet40은 train/test가 분리되어 있으므로 각각 로드
+        train_data = load_modelnet40_data('train')
+        test_data = load_modelnet40_data('test')
+        
+        train_dataset = RegistrationDataset(
+            dataset_name=dataset_name,
+            data_source=train_data,
+            num_points=cfg.data.num_points,
+            partition='train',
+            gaussian_noise=cfg.data.gaussian_noise,
+            unseen=cfg.data.unseen,
+            factor=cfg.data.factor
+        )
+        
+        test_dataset = RegistrationDataset(
+            dataset_name=dataset_name,
+            data_source=test_data,
+            num_points=cfg.data.num_points,
+            partition='test',
+            gaussian_noise=False,
+            unseen=cfg.data.unseen,
+            factor=cfg.data.factor
+        )
+        
+    elif dataset_name.lower() == 'bunny':
+        # Bunny는 단일 파일이므로 한 번만 로드하여 공유
+        print(f"Loading Bunny from {bunny_path}...")
+        shared_data = load_bunny_data(bunny_path)
+        
+        train_dataset = RegistrationDataset(
+            dataset_name=dataset_name,
+            data_source=shared_data,
+            num_points=cfg.data.num_points,
+            partition='train',
+            gaussian_noise=cfg.data.gaussian_noise,
+            unseen=cfg.data.unseen,
+            factor=cfg.data.factor
+        )
+        
+        test_dataset = RegistrationDataset(
+            dataset_name=dataset_name,
+            data_source=shared_data,
+            num_points=cfg.data.num_points,
+            partition='test',
+            gaussian_noise=False,
+            unseen=cfg.data.unseen,
+            factor=cfg.data.factor
+        )
+    else:
+        raise ValueError(f"Unknown dataset name: {dataset_name}")
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
