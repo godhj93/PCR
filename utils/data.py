@@ -235,19 +235,24 @@ class RegistrationDataset(Dataset):
         elif self.dataset_name == 'bunny':
             return self.virtual_size
         return 0
-
-
 def data_loader(cfg):
-    # cfg.data.dataset_name에 따라 분기
-    dataset_name = getattr(cfg.data, 'dataset_name', 'modelnet40')
-    bunny_path = getattr(cfg.data, 'bunny_path', 'reconstruction/bun_zipper.ply')
+    """
+    cfg: Hydra 또는 OmegaConf 객체
+    필수 설정:
+    - cfg.data.name: 데이터셋 이름 ('modelnet40' 또는 'bunny')
+    - cfg.data.num_points: 샘플링할 점의 개수
+    - cfg.training.batch_size: 배치 사이즈
+    """
     
-    # 데이터 한 번만 로드 (train과 test에서 공유)
-    shared_data = None
-    
-    if dataset_name.lower() == 'modelnet40':
-        print("Loading ModelNet40 data...")
-        # ModelNet40은 train/test가 분리되어 있으므로 각각 로드
+    # 1. 필수 설정 존재 여부 체크 (없으면 즉시 에러)
+    try:
+        dataset_name = cfg.data.name.lower()
+    except (AttributeError, KeyError):
+        raise KeyError("Config Error: 'cfg.data.name'이 정의되지 않았습니다. (modelnet40 또는 bunny)")
+
+    # 2. 데이터 로드 로직
+    if dataset_name == 'modelnet40':
+        print(f"Loading ModelNet40 data (num_points: {cfg.data.num_points})...")
         train_data = load_modelnet40_data('train')
         test_data = load_modelnet40_data('test')
         
@@ -260,7 +265,6 @@ def data_loader(cfg):
             unseen=cfg.data.unseen,
             factor=cfg.data.factor
         )
-        
         test_dataset = RegistrationDataset(
             dataset_name=dataset_name,
             data_source=test_data,
@@ -271,10 +275,13 @@ def data_loader(cfg):
             factor=cfg.data.factor
         )
         
-    elif dataset_name.lower() == 'bunny':
-        # Bunny는 단일 파일이므로 한 번만 로드하여 공유
-        print(f"Loading Bunny from {bunny_path}...")
-        shared_data = load_bunny_data(bunny_path)
+    elif dataset_name == 'bunny':
+        # Bunny 경로 체크
+        if not hasattr(cfg.data, 'bunny_path'):
+            raise KeyError("Config Error: Bunny 데이터셋을 위해 'cfg.data.bunny_path'가 필요합니다.")
+            
+        print(f"Loading Bunny from {cfg.data.bunny_path}...")
+        shared_data = load_bunny_data(cfg.data.bunny_path)
         
         train_dataset = RegistrationDataset(
             dataset_name=dataset_name,
@@ -285,7 +292,6 @@ def data_loader(cfg):
             unseen=cfg.data.unseen,
             factor=cfg.data.factor
         )
-        
         test_dataset = RegistrationDataset(
             dataset_name=dataset_name,
             data_source=shared_data,
@@ -296,23 +302,26 @@ def data_loader(cfg):
             factor=cfg.data.factor
         )
     else:
-        raise ValueError(f"Unknown dataset name: {dataset_name}")
+        raise ValueError(f"Unsupported dataset: {dataset_name}. 'modelnet40' 또는 'bunny'여야 합니다.")
 
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=cfg.training.batch_size,
-        shuffle=True,
-        num_workers=cfg.data.num_workers,
-        drop_last=True
-    )
-    
-    test_loader = torch.utils.data.DataLoader(
-        test_dataset,
-        batch_size=cfg.training.batch_size,
-        shuffle=False,
-        num_workers=cfg.data.num_workers,
-        drop_last=False
-    )
+    # 3. DataLoader 생성 (batch_size 등 필수값 체크)
+    try:
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=cfg.training.batch_size,
+            shuffle=True,
+            num_workers=cfg.data.num_workers,
+            drop_last=True
+        )
+        test_loader = torch.utils.data.DataLoader(
+            test_dataset,
+            batch_size=cfg.training.batch_size,
+            shuffle=False,
+            num_workers=cfg.data.num_workers,
+            drop_last=False
+        )
+    except (AttributeError, KeyError) as e:
+        raise KeyError(f"Config Error: DataLoader 설정이 누락되었습니다. ({e})")
     
     return train_loader, test_loader
 
