@@ -335,7 +335,62 @@ def draw_gravity_arrow(ax, origin, vector, color, label, scale=1.5):
             # 텍스트 라벨 (약간 띄워서)
             ax.text(x + u*1.1, y + v*1.1, z + w*1.1, label, color=color, 
                     fontsize=12, fontweight='bold', zorder=101)
-            
+           
+def draw_uncertainty_cone(ax, origin, mu_vec, kappa_val, scale=0.8, color='red'):
+    """
+    예측된 방향 벡터 주변에 불확실성 원뿔(Wireframe Cone)을 그립니다.
+    kappa 값이 클수록 원뿔의 각도가 좁아집니다.
+    """
+    # 1. Kappa를 각도(Degree)로 변환 (Heuristic 방식)
+    # kappa가 매우 크면 각도가 0에 수렴, 작으면 커짐.
+    # 시각적 명확성을 위해 최대 각도를 제한합니다 (예: 45도).
+    max_angle_deg = 45.0
+    # kappa가 0일 때를 대비해 작은 값(1e-1) 추가
+    angle_deg = max_angle_deg / np.sqrt(kappa_val + 0.1)
+    angle_deg = np.clip(angle_deg, 1.0, 60.0) # 최소 1도, 최대 60도로 제한
+    angle_rad = np.radians(angle_deg)
+
+    # 2. 원뿔 기하학 계산
+    mu_norm = mu_vec / (np.linalg.norm(mu_vec) + 1e-8)
+    
+    # mu 벡터에 수직인 기저 벡터(v1, v2) 찾기 (원뿔 밑면 원을 그리기 위해)
+    # 임의의 참조 벡터(ref)와 외적을 이용
+    if np.isclose(abs(mu_norm[2]), 1.0):
+        ref = np.array([1.0, 0.0, 0.0]) # mu가 Z축과 평행할 경우 X축 참조
+    else:
+        ref = np.array([0.0, 0.0, 1.0]) # 그 외에는 Z축 참조
+        
+    v1 = np.cross(mu_norm, ref)
+    v1 = v1 / np.linalg.norm(v1)
+    v2 = np.cross(mu_norm, v1) # mu, v1에 모두 수직인 벡터
+
+    # 3. 원뿔 그리기 (Wireframe 방식)
+    height = scale * 1.0 # 화살표 길이와 맞춤
+    radius = height * np.tan(angle_rad) # 원뿔 밑면 반지름
+
+    # 원뿔 밑면 원주상의 점들 생성
+    theta = np.linspace(0, 2*np.pi, 20) # 20개의 선으로 표현
+    cone_tip_center = origin + mu_norm * height # 화살표 끝점
+
+    circle_points = []
+    for t in theta:
+        # 원주상의 점 좌표 계산
+        pt_on_circle = cone_tip_center + radius * (np.cos(t)*v1 + np.sin(t)*v2)
+        circle_points.append(pt_on_circle)
+        
+        # 원점(origin)에서 원주상의 점으로 이어지는 선 그리기 (반투명)
+        ax.plot([origin[0], pt_on_circle[0]], 
+                [origin[1], pt_on_circle[1]], 
+                [origin[2], pt_on_circle[2]],
+                color=color, alpha=0.2, linewidth=1)
+
+    # 밑면 원 테두리 그리기
+    circle_points = np.array(circle_points)
+    # 시작점과 끝점을 이어주기 위해 마지막에 첫 점 추가
+    circle_points = np.vstack([circle_points, circle_points[0]])
+    ax.plot(circle_points[:,0], circle_points[:,1], circle_points[:,2],
+            color=color, alpha=0.4, linewidth=2, linestyle='--')
+    
 # --- Main Test Code ---
 if __name__ == '__main__':
     import argparse
