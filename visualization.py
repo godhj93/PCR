@@ -116,7 +116,7 @@ def main(ckpt_path):
     
     # 3. 체크포인트(가중치) 로드
     print(f"Loading weights from {ckpt_path}")
-    ckpt = torch.load(os.path.join(ckpt_path, 'weights', 'best.pt'), map_location=device)
+    ckpt = torch.load(os.path.join(ckpt_path, 'weights', 'ckpt.pt'), map_location=device)
     model.load_state_dict(ckpt['model_state_dict'])
     
     # 4. 데이터 로더 준비

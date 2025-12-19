@@ -77,7 +77,7 @@ def train(cfg: DictConfig) -> None:
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': best_loss,
-            }, checkpoint_dir / "best.pt")
+            }, checkpoint_dir / "ckpt.pt")
             log.info(f"Saved Best Model with Test Loss: {best_loss:.4f} at Epoch {epoch}")
         
     writer.close()
