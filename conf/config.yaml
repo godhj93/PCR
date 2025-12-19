@@ -40,7 +40,7 @@ loss:
 optimizer:
   name: sgd
   lr: 1e-3
-  weight_decay: 1e-4
+  weight_decay: 1e-5
   momentum: true
   nesterov: false
   use_scheduler: true

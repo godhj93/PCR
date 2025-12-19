@@ -1,3 +1,7 @@
+checkpoints/
+flow_matching/
+multirun/
+reconstruction/
 vnn_pc/
 runs/
 data/

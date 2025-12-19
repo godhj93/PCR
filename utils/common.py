@@ -36,12 +36,19 @@ def train_one_epoch(model, data_loader, optimizer, loss_fn, epoch, metric, cfg):
     
     for batch in pbar:
         
+        # Data Load
+        p = batch['p'].to(cfg.device)         # (B, 3, N)
         q = batch['q'].to(cfg.device)         # (B, 3, N)
+        
+        gravity_p = batch['gravity_p'].to(cfg.device) # (B, 3)
         gravity_q = batch['gravity_q'].to(cfg.device) # (B, 3)
         
-        mu_g, kappa_g = model(q)
+        # Forward Pass
+        mu_p, mu_q, kappa = model(p, q)
         
-        loss = loss_fn(mu_g, kappa_g, gravity_q)
+        loss_p = loss_fn(mu_p, kappa, gravity_p)
+        loss_q = loss_fn(mu_q, kappa, gravity_q)
+        loss = (loss_p + loss_q) / 2.0
         
         optimizer.zero_grad()
         loss.backward()
@@ -49,7 +56,7 @@ def train_one_epoch(model, data_loader, optimizer, loss_fn, epoch, metric, cfg):
         
         AvgMeter_train.update(loss.item(), q.size(0))
         
-        pbar.set_description(f"Epoch [{epoch}] Train Loss: {AvgMeter_train.avg:.4f}")
+        pbar.set_description(f"Epoch [{epoch}] Train Loss: {AvgMeter_train.avg:.4f}, kappa: {kappa.mean().item():.4f}")
         
     # Validation
     val_loss = test_one_epoch(model, data_loader['test'], loss_fn, metric, cfg)
@@ -66,16 +73,23 @@ def test_one_epoch(model, test_loader, loss_fn, metric, cfg, epoch=0, visualize=
     with torch.no_grad():
         for batch in pbar:
             
+            # Data Load
+            p = batch['p'].to(cfg.device)         # (B, 3, N)
             q = batch['q'].to(cfg.device)         # (B, 3, N)
+            
+            gravity_p = batch['gravity_p'].to(cfg.device) # (B, 3)
             gravity_q = batch['gravity_q'].to(cfg.device) # (B, 3)
             
-            mu_g, kappa_g = model(q)
+            # Forward Pass
+            mu_p, mu_q, kappa = model(p, q)
             
-            loss = loss_fn(mu_g, kappa_g, gravity_q)
+            loss_p = loss_fn(mu_p, kappa, gravity_p)
+            loss_q = loss_fn(mu_q, kappa, gravity_q)
+            loss = (loss_p + loss_q) / 2.0
             
             AvgMeter_val.update(loss.item(), q.size(0))
             
-            pbar.set_description(f"Epoch [{epoch}] Val Loss: {AvgMeter_val.avg:.4f}")
+            pbar.set_description(f"Epoch [{epoch}] Val Loss: {AvgMeter_val.avg:.4f}, kappa: {kappa.mean().item():.4f}")
             
     return AvgMeter_val.avg 
 

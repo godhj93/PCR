@@ -1,0 +1,4 @@
+# @package model
+_target_: utils.model.PointNet_VN_Gravity_Bayes_Joint
+pooling: max
+normal_channel: false

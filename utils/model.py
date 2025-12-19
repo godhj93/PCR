@@ -6,7 +6,6 @@ from utils.dgcnn_vn import VN_DGCNN_Encoder
 from utils.layers import VNLinearLeakyReLU, VNLinear, VNInvariant
 import numpy as np
 
-
 class PointNet_VN_Gravity(nn.Module):
     def __init__(self, pooling, normal_channel=True):
         super(PointNet_VN_Gravity, self).__init__()
@@ -29,7 +28,6 @@ class PointNet_VN_Gravity(nn.Module):
         g_pred = x.view(-1, 3)
         g_pred = F.normalize(g_pred, p=2, dim=1)
         return g_pred
-
 
 class PointNet_VN_Gravity_Bayes(PointNet_VN_Gravity):
     def __init__(self, pooling, normal_channel=True):
@@ -59,6 +57,45 @@ class PointNet_VN_Gravity_Bayes(PointNet_VN_Gravity):
         kappa = kappa + 1.0
         
         return mu, kappa
+    
+class PointNet_VN_Gravity_Bayes_Joint(PointNet_VN_Gravity_Bayes):
+    def __init__(self, pooling, normal_channel=True):
+        super(PointNet_VN_Gravity_Bayes_Joint, self).__init__(pooling, normal_channel)
+    
+    def forward(self, p, q):
+        # 1. Feature Extraction (Siamese)
+        feat_p = self.feat(p)  # (B, 1024//3, 3)
+        feat_q = self.feat(q)  # (B, 1024//3, 3)
+        
+        # 2. Shared MLP (Backbone)
+        feat_p = self.vn_fc1(feat_p)
+        feat_p = self.vn_fc2(feat_p) # (B, 128, 3)
+        
+        feat_q = self.vn_fc1(feat_q)
+        feat_q = self.vn_fc2(feat_q) # (B, 128, 3)
+        
+        # -----------------------------------------------------------
+        # 3. Mu Branch (Independent)
+        # -----------------------------------------------------------
+        mu_p = self.vn_fc3(feat_p)
+        mu_p = F.normalize(mu_p.view(-1, 3), p=2, dim=1)
+        
+        mu_q = self.vn_fc3(feat_q)
+        mu_q = F.normalize(mu_q.view(-1, 3), p=2, dim=1)
+        
+        # -----------------------------------------------------------
+        # 4. Kappa Branch (Joint)
+        # -----------------------------------------------------------
+        inv_feat_p = self.vn_invariant(feat_p) # (B, 128)
+        inv_feat_q = self.vn_invariant(feat_q) # (B, 128)
+        
+        combined_inv_feat = inv_feat_p + inv_feat_q # (B, 128)
+        
+        kappa = self.kappa_mlp(combined_inv_feat)
+        kappa = kappa + 1.0
+        
+        # 반환: P의 중력, Q의 중력, 그리고 공통된 확신도
+        return mu_p, mu_q, kappa
     
 class DGCNN_VN_Gravity(nn.Module):
     def __init__(self, k=20, normal_channel=False):
@@ -163,5 +200,4 @@ if __name__ == '__main__':
     # Kappa는 Invariant 해야 함 (회전해도 불확실성은 같아야 함)
     kappa_loss = F.mse_loss(kappa1, kappa2)
     print(f"Invariance Loss (Kappa): {kappa_loss.item():.6f}")
-    
     print("Output Shape (Mu):", mu1.shape)

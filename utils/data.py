@@ -126,115 +126,168 @@ class RegistrationDataset(Dataset):
         else:
             raise ValueError(f"Unknown dataset name: {dataset_name}")
 
-    def __getitem__(self, item):
-        # 1. Point Cloud 데이터 가져오기
-        if self.dataset_name == 'modelnet40':
-            
-            pointcloud = self.data[item][:self.num_points]
-            
-        elif self.dataset_name == 'bunny':
-            
-            total_pts = self.bunny_points.shape[0]
-            
-            if self.partition == 'train':
-                idx = np.random.choice(total_pts, self.num_points, replace=False)
-            else:
-                # 테스트 시에는 결정론적 결과를 위해 시드 고정 후 샘플링
-                np.random.seed(item) 
-                idx = np.random.choice(total_pts, self.num_points, replace=False)
-            
-            pointcloud = self.bunny_points[idx]
-
-        # Normalize Point Cloud
-        centroid = np.mean(pointcloud, axis=0)
-        pointcloud = pointcloud - centroid
+    def _generate_rotation(self, seed_idx=None):
         
-        max_dist = np.max(np.sqrt(np.sum(pointcloud**2, axis=1)))
-        pointcloud = pointcloud / (max_dist + 1e-8)
+        if self.partition != 'train' and seed_idx is not None:
+            np.random.seed(seed_idx)
         
-        # 3. Random Rotation & Translation 생성
-        if self.partition != 'train':
-            np.random.seed(item)
-
         anglex = np.random.uniform() * np.pi / self.factor
         angley = np.random.uniform() * np.pi / self.factor
         anglez = np.random.uniform() * np.pi / self.factor
-
+        
         cosx, cosy, cosz = np.cos(anglex), np.cos(angley), np.cos(anglez)
         sinx, siny, sinz = np.sin(anglex), np.sin(angley), np.sin(anglez)
-
+        
         Rx = np.array([[1, 0, 0],
                        [0, cosx, -sinx],
                        [0, sinx, cosx]])
+        
         Ry = np.array([[cosy, 0, siny],
                        [0, 1, 0],
                        [-siny, 0, cosy]])
+        
         Rz = np.array([[cosz, -sinz, 0],
-                       [sinz, cosz, 0],
-                       [0, 0, 1]])
-        R_ab = Rx.dot(Ry).dot(Rz)
+                          [sinz, cosz, 0],
+                          [0, 0, 1]])
+        
+        # Euler angle: Rx -> Ry -> Rz 순서로 회전 적용
+        R = Rx.dot(Ry).dot(Rz)
+        
+        euler = np.array([anglez, angley, anglex])  # ZYX 순서
+        
+        return R.astype('float32'), euler.astype('float32')
+            
+    def __getitem__(self, item):
+        # ---------------------------------------------------------------------
+        # 1. Point Cloud 데이터 가져오기
+        # ---------------------------------------------------------------------
+        if self.dataset_name == 'modelnet40':
+            pointcloud = self.data[item][:self.num_points]
+            
+        elif self.dataset_name == 'bunny':
+            total_pts = self.bunny_points.shape[0]
+            if self.partition == 'train':
+                idx = np.random.choice(total_pts, self.num_points, replace=False)
+            else:
+                np.random.seed(item) 
+                idx = np.random.choice(total_pts, self.num_points, replace=False)
+            pointcloud = self.bunny_points[idx]
+
+        # ---------------------------------------------------------------------
+        # 2. Normalization (Unit Sphere)
+        # ---------------------------------------------------------------------
+        centroid = np.mean(pointcloud, axis=0)
+        pointcloud = pointcloud - centroid
+        max_dist = np.max(np.sqrt(np.sum(pointcloud**2, axis=1)))
+        pointcloud = pointcloud / (max_dist + 1e-8)
+        
+        # [Backup] 원본(Canonical) 데이터 저장 (Evaluation용 GT)
+        p_canonical = pointcloud.copy()
+        
+        # ---------------------------------------------------------------------
+        # 3. Source(P) Augmentation (랜덤 회전)
+        # ---------------------------------------------------------------------
+        # P를 위한 독립적인 시드 생성 (Test 시 고정, Train 시 랜덤)
+        # item + 100000을 하여 Q의 회전과 패턴이 겹치지 않게 함
+        seed_p = item + 100000 if self.partition != 'train' else None
+        
+        # P 자체를 돌리는 절대 회전 (R_src)
+        R_src, _ = self._generate_rotation(seed_p)
+
+        # P0: 네트워크 입력용 (Rotated)
+        P0 = (R_src @ p_canonical.T).T
+        
+        # P의 중력 벡터도 같이 회전됨! (중요)
+        g_p = (R_src @ self.gravity_world).astype('float32')
+
+        # ---------------------------------------------------------------------
+        # 4. Target(Q) 생성 (Relative Rotation & Translation)
+        # ---------------------------------------------------------------------
+        # Q를 위한 시드 생성
+        seed_q = item if self.partition != 'train' else None
+        
+        # R_ab: P에서 Q로 가는 상대 회전
+        R_ab, euler_ab = self._generate_rotation(seed_q)
         R_ba = R_ab.T
 
+        # Translation 생성
+        if self.partition != 'train':
+            np.random.seed(item)
+            
         translation_ab = np.array([
             np.random.uniform(-0.5, 0.5),
             np.random.uniform(-0.5, 0.5),
             np.random.uniform(-0.5, 0.5)
-        ])
+        ], dtype='float32')
         translation_ba = -R_ba.dot(translation_ab)
 
-        # 4. Source(P) & Target(Q) 생성
-        P0 = pointcloud
-        # 회전 적용: Q = R * P + t
+        # Q0 생성: Q = R_ab * P + t_ab
+        # (이미 회전된 P0에다가 추가로 R_ab를 적용)
         Q0 = (R_ab @ P0.T).T + translation_ab[None, :]
+        
+        # Q의 중력 벡터: P의 중력 벡터에 R_ab 적용
+        g_q = (R_ab @ g_p).astype('float32')
+        
+        euler_ba = -euler_ab[::-1]
 
+        # ---------------------------------------------------------------------
+        # 5. Noise Injection
+        # ---------------------------------------------------------------------
         if self.gaussian_noise:
             P0 = jitter_pointcloud(P0)
             Q0 = jitter_pointcloud(Q0)
-            
-        euler_ab = np.asarray([anglez, angley, anglex])
-        euler_ba = -euler_ab[::-1]
+            # p_canonical은 노이즈 없이 깨끗한 상태로 둠 (GT 역할)
 
-        # 5. Shuffle (Point Order Invariance 학습을 위해)
+        # ---------------------------------------------------------------------
+        # 6. Shuffle Points (Order Invariance)
+        # ---------------------------------------------------------------------
         N = self.num_points
         perm_p = np.random.permutation(N)
         perm_q = np.random.permutation(N)
 
+        # 입력 데이터 셔플
         P = P0[perm_p]
         Q = Q0[perm_q]
+        
+        # [중요] Canonical P도 P와 동일한 순서로 셔플해야 1:1 대응이 유지됨
+        P_raw = p_canonical[perm_p]
 
-        # 6. GT Correspondence 생성
+        # GT Correspondence Index
         inv_perm_p = np.argsort(perm_p)
         inv_perm_q = np.argsort(perm_q)
         corr = np.stack([inv_perm_p, inv_perm_q], axis=1).astype('int64')
 
-        # ! 7. 중력 방향 생성 (각 스캔의 센서 프레임에서의 gravity)
-        # ! 가정: P는 world frame과 정렬되어 있고, world에서의 중력은 self.gravity_world
-        # !       Q는 R_ab를 거친 frame이므로, g_Q = R_ab * g_world
-        g_p = self.gravity_world.astype('float32')                      # (3,)
-        g_q = (R_ab @ self.gravity_world).astype('float32')             # (3,)
-
-        data = {
-            'p': P.T.astype('float32'),      # (3, N)
-            'q': Q.T.astype('float32'),      # (3, N)
-            'R_pq': R_ab.astype('float32'),
+        # ---------------------------------------------------------------------
+        # 7. Final Data Dict
+        # ---------------------------------------------------------------------
+        return {
+            'p': P.T.astype('float32'),          # (3, N) - Rotated Input
+            'p_raw': P_raw.T.astype('float32'),  # (3, N) - Canonical GT (Evaluation용)
+            'q': Q.T.astype('float32'),          # (3, N) - Rotated Target Input
+            
+            'R_src': R_src.astype('float32'),       # P_raw -> P (Absolute Rotation)
+            'R_pq': R_ab.astype('float32'),         # P -> Q (Relative Rotation, 정답 라벨)
             't_pq': translation_ab.astype('float32'),
+            
             'R_qp': R_ba.astype('float32'),
             't_qp': translation_ba.astype('float32'),
+            
             'euler_pq': euler_ab.astype('float32'),
             'euler_qp': euler_ba.astype('float32'),
+            
             'corr_idx': corr,
-            # ! Gravity 정보 (네트워크 전처리에서 SO(2) 정렬에 사용)
-            'gravity_p': g_p,   # (3,)
-            'gravity_q': g_q,   # (3,)
+            
+            'gravity_p': g_p,   # P의 중력 벡터 (가변적)
+            'gravity_q': g_q,   # Q의 중력 벡터
         }
-        return data
-
+        
     def __len__(self):
         if self.dataset_name == 'modelnet40':
             return self.data.shape[0]
         elif self.dataset_name == 'bunny':
             return self.virtual_size
         return 0
+
 def data_loader(cfg):
     """
     cfg: Hydra 또는 OmegaConf 객체
