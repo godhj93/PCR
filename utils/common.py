@@ -59,7 +59,7 @@ def train_one_epoch(model, data_loader, optimizer, loss_fn, epoch, metric, cfg):
         pbar.set_description(f"Epoch [{epoch}] Train Loss: {AvgMeter_train.avg:.4f}, kappa: {kappa.mean().item():.4f}")
         
     # Validation
-    val_loss = test_one_epoch(model, data_loader['test'], loss_fn, metric, cfg)
+    val_loss = test_one_epoch(model, data_loader['test'], loss_fn, metric, cfg, epoch)
     
     return {'train_loss': AvgMeter_train.avg, 'val_loss': val_loss}
     
