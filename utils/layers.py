@@ -9,6 +9,126 @@ import torch.nn.functional as F
 
 EPS = 1e-6
 
+class NormalEstimator(nn.Module):
+    def __init__(self, k=30):
+        super(NormalEstimator, self).__init__()
+        self.k = k
+
+    def forward(self, x):
+        """
+        Input: x (B, 3, N) - Pure XYZ Point Cloud
+        Output: x_out (B, 6, N) - XYZ + Estimated Normal
+        """
+        B, C, N = x.shape
+        
+        # 1. KNN Search
+        x_t = x.transpose(1, 2).contiguous() # (B, N, 3)
+        
+        # 거리 행렬 계산 (x^2 + y^2 - 2xy)
+        xx = torch.sum(x_t ** 2, dim=2, keepdim=True)
+        # matmul의 두 번째 인자는 x (B, 3, N)를 그대로 사용
+        pairwise_dist = xx + xx.transpose(2, 1) - 2 * torch.matmul(x_t, x)
+        
+        # 가장 가까운 k개 이웃 인덱스 (B, N, k)
+        idx = pairwise_dist.topk(k=self.k, dim=-1, largest=False)[1]
+
+        # 2. Gather Neighbors
+        batch_indices = torch.arange(B, device=x.device).view(B, 1, 1).expand(-1, N, self.k)
+        # Gather를 위한 인덱스 확장
+        # idx는 (B, N, k) 형태
+        
+        # (B, N, k, 3) 형태로 이웃 점 가져오기
+        neighbors = x_t[batch_indices, idx, :] 
+
+        # 3. PCA (Local Plane Estimation)
+        centroid = neighbors.mean(dim=2, keepdim=True)
+        centered = neighbors - centroid # (B, N, k, 3)
+        
+        # 공분산 행렬: (B, N, 3, k) @ (B, N, k, 3) -> (B, N, 3, 3)
+        cov = torch.matmul(centered.transpose(2, 3), centered)
+
+        # 4. Eigen Decomposition
+        # e: 고유값, v: 고유벡터 (오름차순 정렬됨)
+        e, v = torch.linalg.eigh(cov) 
+        
+        # 가장 작은 고유값에 해당하는 벡터 = Normal
+        normals = v[:, :, :, 0] # (B, N, 3)
+
+        # 5. Orientation Correction
+        # 시선 방향(-x_t)과 내적하여 양수가 되도록 뒤집기
+        view_dir = -x_t 
+        dot_prod = (view_dir * normals).sum(dim=-1, keepdim=True)
+        mask = (dot_prod < 0).float()
+        normals = normals * (1 - 2 * mask)
+
+        # (B, 3, N) 형태로 복구
+        normals = normals.transpose(1, 2).contiguous()
+        
+        # 6. Concatenate
+        x_out = torch.cat([x, normals], dim=1) # (B, 6, N)
+        return x_out
+    
+class VN_Attention(nn.Module):
+    def __init__(self, in_channels):
+        super(VN_Attention, self).__init__()
+        self.q_proj = VNLinear(in_channels, in_channels)
+        self.k_proj = VNLinear(in_channels, in_channels)
+        self.v_proj = VNLinear(in_channels, in_channels)
+        self.scale = in_channels ** -0.5
+
+    def forward(self, x):
+        # x: [B, C, 3, N]
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        
+        # [수정] 3차원 벡터(u=3)에 대해 내적을 수행해야 함
+        # q: b, c, u, i (u=3, i=N)
+        # k: b, c, u, j (u=3, j=N)
+        # 결과: b, c, i, j (N x N Attention Map)
+        attn_logits = torch.einsum('bcui, bcuj -> bcij', q, k) * self.scale
+        attn_weights = F.softmax(attn_logits, dim=-1)
+        
+        # [수정] Attention Weight(N x N)를 Value(3 x N)에 반영
+        # weights: b, c, i, j
+        # v: b, c, u, j
+        # 결과: b, c, u, i (u=3, i=N)
+        out = torch.einsum('bcij, bcuj -> bcui', attn_weights, v)
+        
+        return x + out
+
+class VN_Cross_Gating(nn.Module):
+    def __init__(self, in_channels):
+        super(VN_Cross_Gating, self).__init__()
+        self.q_proj = VNLinear(in_channels, in_channels)
+        self.k_proj = VNLinear(in_channels, in_channels)
+        self.scale = in_channels ** -0.5
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(in_channels, in_channels),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x, y):
+        # x: [B, C, 3, N]
+        q = self.q_proj(x)
+        k = self.k_proj(y)
+        
+        # [수정] u=3 (벡터 차원)에 대해 내적
+        # q: bcui, k: bcuj -> map: bcij
+        attn_logits = torch.einsum('bcui, bcuj -> bcij', q, k) * self.scale
+        
+        # Max Pooling over reference points (dim=-1)
+        # [B, C, N, M] -> [B, C, N]
+        relevance_score, _ = torch.max(attn_logits, dim=-1)
+        
+        # Gate 생성
+        # [B, C, N] -> [B, N, C] (Linear용)
+        gate = self.gate_mlp(relevance_score.transpose(1, 2))
+        # [B, N, C] -> [B, C, 1, N] (Broadcasting용: 1은 벡터차원, N은 점 차원)
+        gate = gate.transpose(1, 2).unsqueeze(2)
+        
+        out = x * gate
+        return x + out
 
 def knn(x, k):
     inner = -2*torch.matmul(x.transpose(2, 1), x)

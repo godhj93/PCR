@@ -6,49 +6,32 @@ import os
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 from utils.data import data_loader, draw_gravity_arrow, draw_uncertainty_cone
+from utils.common import calculate_angular_error, test_one_epoch, AverageMeter
 
-def calculate_angular_error(v1, v2):
+def visualize_gravity_regression(model, loader, device, loss_fn, cfg, ckpt_path, num_samples=5):
     """
-    두 벡터 사이의 각도 오차(Degree) 계산
+    test_one_epoch를 사용하여 전체 테스트 결과를 평가하고,
+    일부 샘플을 시각화
     """
-    v1 = v1 / (np.linalg.norm(v1) + 1e-8)
-    v2 = v2 / (np.linalg.norm(v2) + 1e-8)
-    dot_product = np.clip(np.dot(v1, v2), -1.0, 1.0)
-    angle = np.arccos(dot_product)
-    return np.degrees(angle)
-
-def visualize_gravity_regression(model, loader, device, num_samples=5):
-    model.eval()
+    # 1. test_one_epoch로 전체 테스트 수행 및 결과 수집
+    metric = {'val': AverageMeter()}
+    print("\n=== Running Test Evaluation ===")
+    avg_loss, results = test_one_epoch(model, loader, loss_fn, metric, cfg, epoch=0, visualize=True)
+    print(f"Test Loss: {avg_loss:.4f}")
     
-    # 1. 배치 데이터 가져오기
-    try:
-        batch = next(iter(loader))
-    except StopIteration:
-        print("Test loader is empty.")
-        return
+    # 2. 시각화를 위한 데이터 추출 (이미 추론된 결과 사용)
+    input_pc = results['q']                # (Total, 3, N) -> 회전된 물체
+    gt_gravity = results['gravity_q']      # (Total, 3) -> 회전된 물체의 로컬 중력
+    pred_mu = results['mu_q']              # (Total, 3) 예측된 중력 방향
+    pred_kappa = results['kappa_q']        # (Total, 1) or (Total,) 집중도
 
-    # 2. 데이터 추출 (Dataset __getitem__ 구조 반영)
-    # Model은 (B, 3, N) 입력을 기대한다고 가정
-    # 'q'는 이미 (3, N)이므로 DataLoader를 거치면 (B, 3, N)이 됨
-    input_pc = batch['q'].to(device)       # (B, 3, N) -> 회전된 물체
-    gt_gravity = batch['gravity_q'].to(device) # (B, 3) -> 회전된 물체의 로컬 중력
+    # CPU 변환 (시각화용) - 이미 CPU에 있음
+    pc_np = input_pc.permute(0, 2, 1).numpy()  # (Total, N, 3)
+    gt_np = gt_gravity.numpy()                  # (Total, 3)
+    pred_mu_np = pred_mu.numpy()                # (Total, 3)
+    pred_kappa_np = pred_kappa.numpy()          # (Total, 1)
 
-    with torch.no_grad():
-        # 3. 모델 추론
-        # 가정: 모델 반환값은 (mu, kappa) 튜플 혹은 딕셔너리
-        outputs = model(input_pc)
-        
-        pred_mu = outputs[0]    # (B, 3) 예측된 중력 방향
-        pred_kappa = outputs[1] # (B, 1) or (B,) 집중도 (Uncertainty의 역수)
-
-    # 4. CPU 변환 (시각화용)
-    # 포인트 클라우드는 시각화를 위해 (B, N, 3)으로 Transpose 필요
-    pc_np = input_pc.permute(0, 2, 1).cpu().numpy()  # (B, N, 3)
-    gt_np = gt_gravity.cpu().numpy()                 # (B, 3)
-    pred_mu_np = pred_mu.cpu().numpy()               # (B, 3)
-    pred_kappa_np = pred_kappa.cpu().numpy()         # (B, 1)
-
-    # 5. Plotting
+    # 3. Plotting
     num_vis = min(num_samples, len(pc_np))
     fig = plt.figure(figsize=(15, 5 * ((num_vis + 2) // 3)))
     
@@ -60,7 +43,7 @@ def visualize_gravity_regression(model, loader, device, num_samples=5):
         centroid = np.mean(pts, axis=0) # 화살표 시작점
         
         # 점군 그리기
-        ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], s=1, c='gray', alpha=0.4, label='Points (Q)')
+        ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], s=1, c='gray', alpha=1.0, label='Points (Q)')
         
         # 벡터 추출
         v_gt = gt_np[i]
@@ -97,9 +80,10 @@ def visualize_gravity_regression(model, loader, device, num_samples=5):
 
     plt.tight_layout()
     # Save 
-    save_path = os.path.join(args.ckpt_path, "gravity_regression_visualization.png")
+    save_path = os.path.join(ckpt_path, "gravity_regression_visualization.png")
     plt.savefig(save_path, dpi=300)
     plt.close()
+    print(f"Visualization saved to: {save_path}")
 
 def main(ckpt_path):
     # 1. Config 로드
@@ -116,17 +100,33 @@ def main(ckpt_path):
     
     # 3. 체크포인트(가중치) 로드
     print(f"Loading weights from {ckpt_path}")
-    ckpt = torch.load(os.path.join(ckpt_path, 'weights', 'ckpt.pt'), map_location=device)
+    # load ckpt.pt or best.pt
+    try:
+        ckpt = torch.load(os.path.join(ckpt_path, 'weights', 'ckpt.pt'), map_location=device)
+    except:
+        ckpt = torch.load(os.path.join(ckpt_path, 'weights', 'best.pt'), map_location=device)
+        
     model.load_state_dict(ckpt['model_state_dict'])
     
     # 4. 데이터 로더 준비
-    # train.py와 동일하게 호출 (보통 (train_loader, test_loader) 반환)
     print("Loading Dataset...")
-    _, test_loader = data_loader(cfg)
+    data_loaders = data_loader(cfg)
+    _, test_loader = data_loaders
     
-    # 5. 시각화 실행
+    # 5. Loss 함수 로드
+    loss_fn = instantiate(cfg.loss)
+    
+    # 6. 시각화 실행
     print("Visualizing Gravity Regression...")
-    visualize_gravity_regression(model, test_loader, device, num_samples=cfg.test.vis_count)
+    visualize_gravity_regression(
+        model, 
+        test_loader, 
+        device, 
+        loss_fn,
+        cfg,
+        ckpt_path,
+        num_samples=cfg.test.vis_count
+    )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Visualize Gravity Regression Model")
