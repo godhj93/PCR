@@ -12,6 +12,9 @@ hydra:
   run:
     # ${model} 대신 ${model_name}을 사용합니다.
     dir: runs/${data.name}/${now:%Y-%m-%d}/${model_name}_${now:%Y-%m-%d-%H-%M-%S}/
+  sweep:
+    dir: runs/${data.name}/${now:%Y-%m-%d}
+    subdir: ${model_name}_${now:%H-%M-%S}_${hydra.job.num}_${hydra.job.override_dirname}
 
 device: cuda:0
 

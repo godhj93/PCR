@@ -1,3 +1,4 @@
+*.png
 checkpoints/
 flow_matching/
 multirun/
