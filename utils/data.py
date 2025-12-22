@@ -86,7 +86,8 @@ class RegistrationDataset(Dataset):
                  partition: str = 'train', 
                  gaussian_noise: bool = False, 
                  unseen: bool = False, 
-                 factor: float = 4):
+                 factor: float = 4,
+                 partial_overlap: bool = True):
         
         self.dataset_name = dataset_name.lower()
         self.num_points = num_points
@@ -94,11 +95,11 @@ class RegistrationDataset(Dataset):
         self.gaussian_noise = gaussian_noise
         self.unseen = unseen
         self.factor = factor
-
+        self.partial_overlap = partial_overlap 
+        
         # ! Gravity 설정 (World frame에서의 중력 방향)
         # ! 여기서는 z-축 음의 방향을 "중력"으로 정의 (예: g_world = (0, 0, -1))
         # ! 실제 로봇/센서 설정에 맞춰 이 벡터를 바꾸면 됨.
-        
         
         if self.dataset_name == 'modelnet40':
             self.gravity_world = np.array([0.0, -1.0, 0.0], dtype='float32')
@@ -156,7 +157,43 @@ class RegistrationDataset(Dataset):
         euler = np.array([anglez, angley, anglex])  # ZYX 순서
         
         return R.astype('float32'), euler.astype('float32')
+      
+    def _partial_crop(self, points):
+        """
+        Helper: Randomly crop the point cloud by a plane and resample.
+        Keep Ratio: 10% ~ 100% (Cropped 0% ~ 90%)
+        """
+        if not self.partial_overlap:
+            return points
+
+        # 1. 랜덤 방향 벡터 생성
+        rand_dir = np.random.randn(3)
+        rand_dir /= np.linalg.norm(rand_dir)
+        
+        # 2. 투영 및 정렬
+        proj = points @ rand_dir
+        sort_idx = np.argsort(proj)
+        
+        # 3. 유지할 비율 결정 (0.1 ~ 1.0) -> 즉 0~90% 잘려나감
+        keep_ratio = np.random.uniform(0.1, 1.0)
+        num_keep = int(len(points) * keep_ratio)
+        
+        # 4. Slicing (상위 num_keep개만 유지)
+        # (방향이 랜덤이므로 상위/하위 구분은 의미상 동일)
+        keep_idx = sort_idx[:num_keep]
+        cropped_points = points[keep_idx]
+        
+        # 5. Resampling (배치 처리를 위해 원래 점 개수로 복원)
+        # 중복 허용하여 원래 num_points 개수만큼 샘플링
+        if len(cropped_points) < self.num_points:
+            choice_idx = np.random.choice(len(cropped_points), self.num_points, replace=True)
+        else:
+            choice_idx = np.random.choice(len(cropped_points), self.num_points, replace=False)
             
+        resampled_points = cropped_points[choice_idx]
+        
+        return resampled_points
+        
     def __getitem__(self, item):
         # ---------------------------------------------------------------------
         # 1. Point Cloud 데이터 가져오기
@@ -166,8 +203,10 @@ class RegistrationDataset(Dataset):
             
         elif self.dataset_name == 'bunny':
             total_pts = self.bunny_points.shape[0]
+            
             if self.partition == 'train':
                 idx = np.random.choice(total_pts, self.num_points, replace=False)
+                
             else:
                 np.random.seed(item) 
                 idx = np.random.choice(total_pts, self.num_points, replace=False)
@@ -190,95 +229,81 @@ class RegistrationDataset(Dataset):
         # P를 위한 독립적인 시드 생성 (Test 시 고정, Train 시 랜덤)
         # item + 100000을 하여 Q의 회전과 패턴이 겹치지 않게 함
         seed_p = item + 100000 if self.partition != 'train' else None
-        
-        # P 자체를 돌리는 절대 회전 (R_src)
-        R_src, _ = self._generate_rotation(seed_p)
-
-        # P0: 네트워크 입력용 (Rotated)
-        P0 = (R_src @ p_canonical.T).T
-        
-        # P의 중력 벡터도 같이 회전됨! (중요)
-        g_p = (R_src @ self.gravity_world).astype('float32')
-
-        # ---------------------------------------------------------------------
-        # 4. Target(Q) 생성 (Relative Rotation & Translation)
-        # ---------------------------------------------------------------------
-        # Q를 위한 시드 생성
         seed_q = item if self.partition != 'train' else None
         
-        # R_ab: P에서 Q로 가는 상대 회전
+        # Rotations
+        R_src, _ = self._generate_rotation(seed_p)
         R_ab, euler_ab = self._generate_rotation(seed_q)
         R_ba = R_ab.T
-
-        # Translation 생성
+        
         if self.partition != 'train':
             np.random.seed(item)
-            
         translation_ab = np.array([
-            np.random.uniform(-0.5, 0.5),
-            np.random.uniform(-0.5, 0.5),
-            np.random.uniform(-0.5, 0.5)
+            np.random.uniform(-10, 10),
+            np.random.uniform(-10, 10),
+            np.random.uniform(-10, 10)
         ], dtype='float32')
+        
         translation_ba = -R_ba.dot(translation_ab)
-
-        # Q0 생성: Q = R_ab * P + t_ab
-        # (이미 회전된 P0에다가 추가로 R_ab를 적용)
-        Q0 = (R_ab @ P0.T).T + translation_ab[None, :]
         
-        # Q의 중력 벡터: P의 중력 벡터에 R_ab 적용
+        if self.partial_overlap:
+            P_crop = self._partial_crop(p_canonical)
+            P0 = (R_src @ P_crop.T).T
+            
+            Q_crop = self._partial_crop(p_canonical)
+            Q0_base = (R_src @ Q_crop.T).T
+            Q0 = (R_ab @ Q0_base.T).T + translation_ab[None, :]
+            
+            corr = np.zeros((self.num_points, 2), dtype='int64')
+            P_raw = P_crop
+        
+        else:
+            # Full Overlap (기존 로직)
+            P0 = (R_src @ p_canonical.T).T
+            Q0 = (R_ab @ P0.T).T + translation_ab[None, :]
+            
+            # Shuffle
+            N = self.num_points
+            perm_p = np.random.permutation(N)
+            perm_q = np.random.permutation(N)
+            
+            P0 = P0[perm_p]
+            Q0 = Q0[perm_q]
+            P_raw = p_canonical[perm_p]
+            
+            # GT Correspondence
+            inv_perm_p = np.argsort(perm_p)
+            inv_perm_q = np.argsort(perm_q)
+            corr = np.stack([inv_perm_p, inv_perm_q], axis=1).astype('int64')
+
+        # Gravity Vectors
+        g_p = (R_src @ self.gravity_world).astype('float32')
         g_q = (R_ab @ g_p).astype('float32')
-        
-        euler_ba = -euler_ab[::-1]
 
-        # ---------------------------------------------------------------------
-        # 5. Noise Injection
-        # ---------------------------------------------------------------------
+        # Noise
         if self.gaussian_noise:
             P0 = jitter_pointcloud(P0)
             Q0 = jitter_pointcloud(Q0)
-            # p_canonical은 노이즈 없이 깨끗한 상태로 둠 (GT 역할)
 
-        # ---------------------------------------------------------------------
-        # 6. Shuffle Points (Order Invariance)
-        # ---------------------------------------------------------------------
-        N = self.num_points
-        perm_p = np.random.permutation(N)
-        perm_q = np.random.permutation(N)
-
-        # 입력 데이터 셔플
-        P = P0[perm_p]
-        Q = Q0[perm_q]
-        
-        # [중요] Canonical P도 P와 동일한 순서로 셔플해야 1:1 대응이 유지됨
-        P_raw = p_canonical[perm_p]
-
-        # GT Correspondence Index
-        inv_perm_p = np.argsort(perm_p)
-        inv_perm_q = np.argsort(perm_q)
-        corr = np.stack([inv_perm_p, inv_perm_q], axis=1).astype('int64')
-
-        # ---------------------------------------------------------------------
-        # 7. Final Data Dict
-        # ---------------------------------------------------------------------
         return {
-            'p': P.T.astype('float32'),          # (3, N) - Rotated Input
-            'p_raw': P_raw.T.astype('float32'),  # (3, N) - Canonical GT (Evaluation용)
-            'q': Q.T.astype('float32'),          # (3, N) - Rotated Target Input
+            'p': P0.astype('float32'),          
+            'p_raw': P_raw.astype('float32'),  
+            'q': Q0.astype('float32'),          
             
-            'R_src': R_src.astype('float32'),       # P_raw -> P (Absolute Rotation)
-            'R_pq': R_ab.astype('float32'),         # P -> Q (Relative Rotation, 정답 라벨)
+            'R_src': R_src.astype('float32'),       
+            'R_pq': R_ab.astype('float32'),         
             't_pq': translation_ab.astype('float32'),
             
             'R_qp': R_ba.astype('float32'),
             't_qp': translation_ba.astype('float32'),
             
             'euler_pq': euler_ab.astype('float32'),
-            'euler_qp': euler_ba.astype('float32'),
+            'euler_qp': -euler_ab[::-1].astype('float32'),
             
-            'corr_idx': corr,
+            'corr_idx': corr, # Partial Overlap일 경우 의미 없는 값(0)일 수 있음 주의
             
-            'gravity_p': g_p,   # P의 중력 벡터 (가변적)
-            'gravity_q': g_q,   # Q의 중력 벡터
+            'gravity_p': g_p,   
+            'gravity_q': g_q,   
         }
         
     def __len__(self):

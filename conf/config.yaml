@@ -18,6 +18,7 @@ device: cuda:0
 training:
   batch_size: 32
   epochs: 300
+  
 
 test:
   num_steps: 10
@@ -31,7 +32,7 @@ data:
   num_points: 1024
   gaussian_noise: 0.01
   unseen: false
-  factor: 4
+  factor: 1
   num_workers: 8
   
 loss:
