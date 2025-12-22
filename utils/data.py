@@ -158,7 +158,7 @@ class RegistrationDataset(Dataset):
         
         return R.astype('float32'), euler.astype('float32')
       
-    def _partial_crop(self, points):
+    def _partial_crop(self, points, seed_idx=None):
         """
         Helper: Randomly crop the point cloud by a plane and resample.
         Keep Ratio: 10% ~ 100% (Cropped 0% ~ 90%)
@@ -166,6 +166,9 @@ class RegistrationDataset(Dataset):
         if not self.partial_overlap:
             return points
 
+        if self.partition != 'train' and seed_idx is not None:
+            np.random.seed(seed_idx)
+            
         # 1. 랜덤 방향 벡터 생성
         rand_dir = np.random.randn(3)
         rand_dir /= np.linalg.norm(rand_dir)
@@ -186,9 +189,19 @@ class RegistrationDataset(Dataset):
         # 5. Resampling (배치 처리를 위해 원래 점 개수로 복원)
         # 중복 허용하여 원래 num_points 개수만큼 샘플링
         if len(cropped_points) < self.num_points:
+            # 점이 모자라서 중복 허용(replace=True)하여 채우는 경우
             choice_idx = np.random.choice(len(cropped_points), self.num_points, replace=True)
+            resampled_points = cropped_points[choice_idx]
+            
+            # [핵심 수정] 중복된 점들이 겹치지 않게 아주 미세한 Jittering 추가
+            # 전체 노이즈 옵션(gaussian_noise)과 무관하게, 구조적 에러 방지를 위해 필수
+            jitter = np.random.normal(scale=1e-6, size=resampled_points.shape)
+            resampled_points = resampled_points + jitter.astype('float32')
+            
         else:
+            # 점이 충분하면 중복 없이 선택 (문제 없음)
             choice_idx = np.random.choice(len(cropped_points), self.num_points, replace=False)
+            resampled_points = cropped_points[choice_idx]
             
         resampled_points = cropped_points[choice_idx]
         
@@ -230,6 +243,8 @@ class RegistrationDataset(Dataset):
         # item + 100000을 하여 Q의 회전과 패턴이 겹치지 않게 함
         seed_p = item + 100000 if self.partition != 'train' else None
         seed_q = item if self.partition != 'train' else None
+        seed_crop_p = item + 200000 if self.partition != 'train' else None
+        seed_crop_q = item + 300000 if self.partition != 'train' else None
         
         # Rotations
         R_src, _ = self._generate_rotation(seed_p)
@@ -247,10 +262,10 @@ class RegistrationDataset(Dataset):
         translation_ba = -R_ba.dot(translation_ab)
         
         if self.partial_overlap:
-            P_crop = self._partial_crop(p_canonical)
+            P_crop = self._partial_crop(p_canonical, seed_crop_p)
             P0 = (R_src @ P_crop.T).T
             
-            Q_crop = self._partial_crop(p_canonical)
+            Q_crop = self._partial_crop(p_canonical, seed_crop_q)
             Q0_base = (R_src @ Q_crop.T).T
             Q0 = (R_ab @ Q0_base.T).T + translation_ab[None, :]
             
@@ -286,9 +301,9 @@ class RegistrationDataset(Dataset):
             Q0 = jitter_pointcloud(Q0)
 
         return {
-            'p': P0.astype('float32'),          
+            'p': P0.T.astype('float32'),          
             'p_raw': P_raw.astype('float32'),  
-            'q': Q0.astype('float32'),          
+            'q': Q0.T.astype('float32'),          
             
             'R_src': R_src.astype('float32'),       
             'R_pq': R_ab.astype('float32'),         
@@ -478,7 +493,6 @@ def draw_uncertainty_cone(ax, origin, mu_vec, kappa_val, scale=0.8, color='red')
     ax.plot(circle_points[:,0], circle_points[:,1], circle_points[:,2],
             color=color, alpha=0.4, linewidth=2, linestyle='--')
     
-# --- Main Test Code ---
 if __name__ == '__main__':
     import argparse
     import sys

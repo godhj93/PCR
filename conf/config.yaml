@@ -1,6 +1,6 @@
 defaults:
   - _self_
-  - model: dgcnn
+  - model: pointnet_v2
   # 선택된 모델 이름을 가져오기 위한 트릭
   - override hydra/job_logging: default
   - override hydra/hydra_logging: default
@@ -27,13 +27,14 @@ test:
   vis_count: 10
 
 data:
-  name: bunny
+  name: modelnet40
   bunny_path: data/bunny/reconstruction/bun_zipper.ply
   num_points: 1024
   gaussian_noise: 0.01
   unseen: false
   factor: 1
   num_workers: 8
+  partial_overlap: False
   
 loss:
   _target_: utils.loss.VMFLoss

@@ -110,7 +110,7 @@ class PointNet_VN_Gravity_Bayes_v2(nn.Module):
         self.mode = mode
         self.feat_dim = 1024
         
-        # [공통] Normal Estimator
+        # Normal Estimator
         self.normal_estimator = NormalEstimator(k=30)
         
         # ==========================================

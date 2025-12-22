@@ -8,7 +8,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 EPS = 1e-6
-
 class NormalEstimator(nn.Module):
     def __init__(self, k=30):
         super(NormalEstimator, self).__init__()
@@ -20,52 +19,59 @@ class NormalEstimator(nn.Module):
         Output: x_out (B, 6, N) - XYZ + Estimated Normal
         """
         B, C, N = x.shape
-        
-        # 1. KNN Search
         x_t = x.transpose(1, 2).contiguous() # (B, N, 3)
         
-        # 거리 행렬 계산 (x^2 + y^2 - 2xy)
+        # 1. KNN Search (안전장치 추가)
         xx = torch.sum(x_t ** 2, dim=2, keepdim=True)
-        # matmul의 두 번째 인자는 x (B, 3, N)를 그대로 사용
+        # 부동소수점 오차로 인해 음수가 나올 수 있으므로 clamp로 0 이상 보장
         pairwise_dist = xx + xx.transpose(2, 1) - 2 * torch.matmul(x_t, x)
+        pairwise_dist = torch.clamp(pairwise_dist, min=0.0) 
         
-        # 가장 가까운 k개 이웃 인덱스 (B, N, k)
+        # 가장 가까운 k개 이웃 (자기 자신 포함 가능성 있음)
         idx = pairwise_dist.topk(k=self.k, dim=-1, largest=False)[1]
 
         # 2. Gather Neighbors
         batch_indices = torch.arange(B, device=x.device).view(B, 1, 1).expand(-1, N, self.k)
-        # Gather를 위한 인덱스 확장
-        # idx는 (B, N, k) 형태
-        
-        # (B, N, k, 3) 형태로 이웃 점 가져오기
-        neighbors = x_t[batch_indices, idx, :] 
+        neighbors = x_t[batch_indices, idx, :] # (B, N, k, 3)
 
-        # 3. PCA (Local Plane Estimation)
+        # 3. PCA & Covariance Calculation
         centroid = neighbors.mean(dim=2, keepdim=True)
-        centered = neighbors - centroid # (B, N, k, 3)
+        centered = neighbors - centroid 
         
-        # 공분산 행렬: (B, N, 3, k) @ (B, N, k, 3) -> (B, N, 3, 3)
+        # Covariance: (B, N, 3, 3)
         cov = torch.matmul(centered.transpose(2, 3), centered)
 
+        # [핵심 수정] Regularization (안전장치)
+        # 모든 점이 겹쳐서 공분산 행렬이 0이 되거나(Singular), 
+        # 고유값이 너무 작아 cusolver가 터지는 것을 방지하기 위해 대각 성분에 아주 작은 값 더함
+        eps = 1e-5
+        eye = torch.eye(3, device=x.device).view(1, 1, 3, 3)
+        cov = cov + eye * eps
+
         # 4. Eigen Decomposition
-        # e: 고유값, v: 고유벡터 (오름차순 정렬됨)
-        e, v = torch.linalg.eigh(cov) 
-        
+        # e: 고유값, v: 고유벡터
+        # Regularization 덕분에 더 이상 에러가 나지 않음
+        try:
+            e, v = torch.linalg.eigh(cov) 
+        except torch._C._LinAlgError:
+            # 만약 그래도 터진다면, CPU로 내려서 처리 후 다시 올림 (속도는 느리지만 최후의 보루)
+            # print("[Warning] CUDA SVD failed. Fallback to CPU.")
+            e, v = torch.linalg.eigh(cov.cpu())
+            v = v.to(x.device)
+
         # 가장 작은 고유값에 해당하는 벡터 = Normal
         normals = v[:, :, :, 0] # (B, N, 3)
 
-        # 5. Orientation Correction
-        # 시선 방향(-x_t)과 내적하여 양수가 되도록 뒤집기
-        view_dir = -x_t 
+        # 5. Orientation Correction (Viewpoint: 0,0,0)
+        view_dir = -x_t
         dot_prod = (view_dir * normals).sum(dim=-1, keepdim=True)
-        mask = (dot_prod < 0).float()
-        normals = normals * (1 - 2 * mask)
+        # 내적이 음수면 반대 방향을 보고 있는 것이므로 뒤집음
+        normals = torch.where(dot_prod < 0, -normals, normals)
 
-        # (B, 3, N) 형태로 복구
+        # (B, 3, N) 형태로 복구 및 병합
         normals = normals.transpose(1, 2).contiguous()
+        x_out = torch.cat([x, normals], dim=1)
         
-        # 6. Concatenate
-        x_out = torch.cat([x, normals], dim=1) # (B, 6, N)
         return x_out
     
 class VN_Attention(nn.Module):
