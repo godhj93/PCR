@@ -1,9 +1,10 @@
 defaults:
   - _self_
   - model: pointnet_v2
-  # 선택된 모델 이름을 가져오기 위한 트릭
+  - optim: sgd
   - override hydra/job_logging: default
   - override hydra/hydra_logging: default
+
 
 # 아래처럼 model_name을 명시적으로 관리하거나, model 변수를 직접 수정합니다.
 model_name: ${hydra:runtime.choices.model}
@@ -22,7 +23,6 @@ training:
   batch_size: 32
   epochs: 300
   
-
 test:
   num_steps: 10
   visualize: true
@@ -41,11 +41,3 @@ data:
   
 loss:
   _target_: utils.loss.VMFLoss
-
-optimizer:
-  name: sgd
-  lr: 1e-3
-  weight_decay: 1e-5
-  momentum: true
-  nesterov: false
-  use_scheduler: true

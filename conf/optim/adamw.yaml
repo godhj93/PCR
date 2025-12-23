@@ -1,0 +1,7 @@
+# hydra config file for AdamW optimizer
+_target_: torch.optim.AdamW
+lr: 1e-3
+weight_decay: 1e-5
+betas:
+  - 0.9
+  - 0.999

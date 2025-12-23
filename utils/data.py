@@ -86,7 +86,7 @@ class RegistrationDataset(Dataset):
                  partition: str = 'train', 
                  gaussian_noise: bool = False, 
                  unseen: bool = False, 
-                 factor: float = 4,
+                 factor: float = 1,
                  partial_overlap: bool = True):
         
         self.dataset_name = dataset_name.lower()
@@ -178,33 +178,41 @@ class RegistrationDataset(Dataset):
         sort_idx = np.argsort(proj)
         
         # 3. 유지할 비율 결정 (0.1 ~ 1.0) -> 즉 0~90% 잘려나감
-        keep_ratio = np.random.uniform(0.1, 1.0)
+        keep_ratio = np.random.uniform(1.0, 1.0)
         num_keep = int(len(points) * keep_ratio)
         
-        # 4. Slicing (상위 num_keep개만 유지)
-        # (방향이 랜덤이므로 상위/하위 구분은 의미상 동일)
+        # 4. Slicing
         keep_idx = sort_idx[:num_keep]
         cropped_points = points[keep_idx]
         
         # 5. Resampling (배치 처리를 위해 원래 점 개수로 복원)
-        # 중복 허용하여 원래 num_points 개수만큼 샘플링
         if len(cropped_points) < self.num_points:
-            # 점이 모자라서 중복 허용(replace=True)하여 채우는 경우
+            
+            # =================================================================
+            # [추가해야 할 부분] 여기가 빠져 있습니다!
+            # =================================================================
+            if self.partition != 'train' and seed_idx is not None:
+                # 같은 seed_idx를 쓰면 위쪽 패턴과 동기화되어 편향될 수 있으므로 +1을 해줍니다.
+                np.random.seed(seed_idx + 1) 
+            # =================================================================
+
             choice_idx = np.random.choice(len(cropped_points), self.num_points, replace=True)
             resampled_points = cropped_points[choice_idx]
             
-            # [핵심 수정] 중복된 점들이 겹치지 않게 아주 미세한 Jittering 추가
-            # 전체 노이즈 옵션(gaussian_noise)과 무관하게, 구조적 에러 방지를 위해 필수
             jitter = np.random.normal(scale=1e-6, size=resampled_points.shape)
             resampled_points = resampled_points + jitter.astype('float32')
             
         else:
-            # 점이 충분하면 중복 없이 선택 (문제 없음)
+            # =================================================================
+            # [추가해야 할 부분] 여기도 추가해주세요.
+            # =================================================================
+            if self.partition != 'train' and seed_idx is not None:
+                np.random.seed(seed_idx + 2) # 다른 값으로 시드 고정
+            # =================================================================
+
             choice_idx = np.random.choice(len(cropped_points), self.num_points, replace=False)
             resampled_points = cropped_points[choice_idx]
             
-        resampled_points = cropped_points[choice_idx]
-        
         return resampled_points
         
     def __getitem__(self, item):
@@ -253,10 +261,11 @@ class RegistrationDataset(Dataset):
         
         if self.partition != 'train':
             np.random.seed(item)
+        dist = 10.0
         translation_ab = np.array([
-            np.random.uniform(-10, 10),
-            np.random.uniform(-10, 10),
-            np.random.uniform(-10, 10)
+            np.random.uniform(-dist, dist),
+            np.random.uniform(-dist, dist),
+            np.random.uniform(-dist, dist)
         ], dtype='float32')
         
         translation_ba = -R_ba.dot(translation_ab)

@@ -38,7 +38,8 @@ def train(cfg: DictConfig) -> None:
     model = hydra.utils.instantiate(cfg.model).to(cfg.device)
     log.info(f"Model Parameters: {count_parameters(model):,}")
     
-    optimizer = torch.optim.SGD(model.parameters(), lr=cfg.optimizer.lr)
+    # optimizer = torch.optim.SGD(model.parameters(), lr=cfg.optimizer.lr)
+    optimizer = hydra.utils.instantiate(cfg.optim, params=model.parameters())
     loss_fn = hydra.utils.instantiate(cfg.loss)
     
     log.info("===== Training Start =====")

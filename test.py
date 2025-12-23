@@ -6,255 +6,238 @@ import os
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 from scipy.spatial import cKDTree as KDTree
-from utils.data import load_modelnet40_data, load_bunny_data, RegistrationDataset
-
-# 사용자가 제공한 라이브러리
+from utils.data import data_loader
 from iterative_closet_point.bunny import run_icp, calculatenormal
 
-def data_loader(cfg):
-    """ Config 설정에 따라 RegistrationDataset 초기화 """
-    dataset_name = cfg.data.name.lower()
-    partial_overlap = getattr(cfg.data, 'partial_overlap', False)
-    print(f"[DataLoader] Partial Overlap Mode: {partial_overlap}")
+# ==================================================================================
+# 1. Math & Metrics Helper
+# ==================================================================================
+class GeometryUtils:
+    @staticmethod
+    def get_gravity_rotation(g_src, g_tgt):
+        """ Calculate rotation matrix to align g_src to g_tgt """
+        u = g_src / (np.linalg.norm(g_src) + 1e-8)
+        v = g_tgt / (np.linalg.norm(g_tgt) + 1e-8)
+        axis = np.cross(u, v)
+        norm_axis = np.linalg.norm(axis)
+        dot = np.dot(u, v)
+        
+        if norm_axis < 1e-6:
+            if dot > 0: return np.eye(3) 
+            else: 
+                if np.abs(u[0]) > 0.9: return np.diag([-1, 1, -1]) 
+                else: return np.diag([1, -1, -1]) 
+            
+        K = np.array([[0, -axis[2], axis[1]],[axis[2], 0, -axis[0]],[-axis[1], axis[0], 0]])
+        R = np.eye(3) + K + (K @ K) * ((1 - dot) / (norm_axis ** 2))
+        return R
 
-    if dataset_name == 'modelnet40':
-        print(f"Loading ModelNet40 data (num_points: {cfg.data.num_points})...")
-        test_data = load_modelnet40_data('test')
-        test_dataset = RegistrationDataset(
-            dataset_name=dataset_name,
-            data_source=test_data,
-            num_points=cfg.data.num_points,
-            partition='test',
-            gaussian_noise=False,
-            unseen=cfg.data.unseen,
-            factor=cfg.data.factor,
-            partial_overlap=partial_overlap
+    @staticmethod
+    def compute_full_metrics(P_pred, P_gt, Q_target, R_pred, R_gt, t_pred, t_gt, ir_thresh=0.1):
+        # 1. RRE
+        R_diff = R_pred.T @ R_gt
+        trace = np.trace(R_diff)
+        trace = np.clip((trace - 1) / 2, -1.0, 1.0)
+        rre = np.degrees(np.arccos(trace))
+        
+        # 2. RTE
+        centroid_pred = np.mean(P_pred, axis=0)
+        centroid_gt = np.mean(P_gt, axis=0)
+        rte = np.linalg.norm(centroid_pred - centroid_gt)
+        
+        # 3. RMSE
+        # Note: RMSE only makes sense if P_pred and P_gt are point-to-point correspondents
+        # For partial overlap, this might be high even if aligned well visually
+        mse = np.mean(np.sum((P_pred - P_gt)**2, axis=1))
+        rmse = np.sqrt(mse)
+        
+        # 4. Inlier Ratio
+        tree = KDTree(Q_target)
+        dists, _ = tree.query(P_pred, k=1)
+        ir = np.mean(dists < ir_thresh) * 100.0
+        
+        return rre, rte, rmse, ir
+
+# ==================================================================================
+# 2. Standard ICP Solver Class
+# ==================================================================================
+class StandardICPSolver:
+    def __init__(self, P, Q, max_iter=60, tol=1e-6):
+        self.P_raw = P
+        self.Q_raw = Q
+        self.max_iter = max_iter
+        self.tol = tol
+        
+        self.norm_P = calculatenormal(P, k=20)
+        self.norm_Q = calculatenormal(Q, k=20)
+        
+        # Initial Centering
+        self.centroid_P = np.mean(P, axis=0)
+        self.centroid_Q = np.mean(Q, axis=0)
+        self.P_centered = P + (self.centroid_Q - self.centroid_P)
+
+    def register_standard(self):
+        # Adaptive Threshold
+        tree = KDTree(self.P_centered)
+        d, _ = tree.query(self.P_centered[:100], k=2)
+        resolution = np.mean(d[:, 1])
+        
+        # Standard ICP
+        R, t, _ = run_icp(
+            self.P_centered, self.Q_raw, method="p2p", 
+            normals_P=self.norm_P, normals_Q=self.norm_Q,
+            max_iter=self.max_iter, tol=self.tol, dist_thresh=10.0*resolution,
+            R_init=np.eye(3), t_init=np.zeros((3,1)), verbose=False
         )
-    elif dataset_name == 'bunny':
-        if not hasattr(cfg.data, 'bunny_path'):
-            raise KeyError("Config Error: Bunny 데이터셋을 위해 'cfg.data.bunny_path'가 필요합니다.")
-        print(f"Loading Bunny from {cfg.data.bunny_path}...")
-        shared_data = load_bunny_data(cfg.data.bunny_path)
-        test_dataset = RegistrationDataset(
-            dataset_name=dataset_name,
-            data_source=shared_data,
-            num_points=cfg.data.num_points,
-            partition='test',
-            gaussian_noise=False,
-            unseen=cfg.data.unseen,
-            factor=cfg.data.factor,
-            partial_overlap=partial_overlap
-        )
-    else:
-        raise ValueError(f"Unsupported dataset: {dataset_name}")
+        
+        # Recover Final Pose
+        t_center = self.centroid_Q - self.centroid_P
+        P_final = (R @ self.P_centered.T).T + t.flatten()
+        t_total = (R @ t_center.reshape(3, 1)).flatten() + t.flatten()
+        
+        return P_final, R, t_total
 
-    test_loader = torch.utils.data.DataLoader(
-        test_dataset,
-        batch_size=cfg.training.batch_size,
-        shuffle=False,
-        num_workers=cfg.data.num_workers,
-        drop_last=False
-    )
-    return test_loader
-
-def compute_resolution(pcd_numpy):
-    if pcd_numpy.shape[0] == 0: return 1.0
-    tree = KDTree(pcd_numpy)
-    n_samples = min(len(pcd_numpy), 1000)
-    indices = np.random.choice(len(pcd_numpy), n_samples, replace=False)
-    sample_pts = pcd_numpy[indices]
-    dists, _ = tree.query(sample_pts, k=2)
-    valid_dists = dists[:, 1][dists[:, 1] > 1e-6] 
-    if len(valid_dists) == 0: return 0.01
-    return np.mean(valid_dists)
-
-def calculate_errors(R_pred, t_pred, R_gt, t_gt):
-    R_diff = R_pred.T @ R_gt
-    trace = np.trace(R_diff)
-    trace = np.clip((trace - 1) / 2, -1.0, 1.0)
-    rot_error = np.degrees(np.arccos(trace))
-    trans_error = np.linalg.norm(t_pred - t_gt)
-    return rot_error, trans_error
-
-def set_axes_equal(ax, points):
-    """ 3D 플롯의 축 비율을 1:1:1로 맞춤 """
+# ==================================================================================
+# 3. Visualization
+# ==================================================================================
+def set_axes_equal_union(ax, points):
     center = points.mean(axis=0)
-    max_range = (points.max(axis=0) - points.min(axis=0)).max() / 2.0
-    
+    max_range = (points.max(axis=0) - points.min(axis=0)).max() / 2.0 * 1.2
     ax.set_xlim(center[0] - max_range, center[0] + max_range)
     ax.set_ylim(center[1] - max_range, center[1] + max_range)
     ax.set_zlim(center[2] - max_range, center[2] + max_range)
-    ax.set_box_aspect((1, 1, 1))
+    ax.set_box_aspect((1, 1, 1)); ax.set_axis_off()
 
-def draw_gravity_arrow(ax, origin, vector, color, label, scale_factor=0.8):
-    """
-    중력 벡터를 화살표로 시각화
-    scale_factor: 점군 크기에 비례하여 화살표 길이 조정
-    """
-    # 벡터 정규화
+def draw_gravity_arrow(ax, origin, vector, color, label, scale):
     v_norm = vector / (np.linalg.norm(vector) + 1e-6)
-    
-    u, v, w = v_norm * scale_factor
+    u, v, w = v_norm * scale
     x, y, z = origin
-    
-    # 화살표 그리기
-    ax.quiver(x, y, z, u, v, w, color=color, length=1.0, normalize=False, 
-              linewidth=2.5, arrow_length_ratio=0.3, zorder=100)
-    
-    # 라벨 표시 (화살표 끝부분)
+    ax.quiver(x, y, z, u, v, w, color=color, length=1.0, normalize=False, linewidth=4.0, arrow_length_ratio=0.25)
     ax.text(x + u, y + v, z + w, label, color=color, fontsize=12, fontweight='bold')
 
-def draw_alignment_result(ax, P_aligned, Q, threshold=0.1, num_lines=100):
-    """ ICP 결과 및 Correspondence 시각화 """
-    ax.scatter(P_aligned[:, 0], P_aligned[:, 1], P_aligned[:, 2], s=1, c='blue', alpha=0.3, label='P (Aligned)')
-    ax.scatter(Q[:, 0], Q[:, 1], Q[:, 2], s=1, c='orange', alpha=0.3, label='Q (Target)')
+def draw_result(ax, P, Q, g_p, g_q, title, metrics_str=None, color_title='black', ir_thresh=0.1):
+    all_pts = np.concatenate([P, Q], axis=0)
+    scale = (all_pts.max(axis=0) - all_pts.min(axis=0)).max() * 0.6
     
-    if len(P_aligned) > 0 and len(Q) > 0:
-        indices = np.random.choice(len(P_aligned), min(len(P_aligned), num_lines), replace=False)
-        P_samp = P_aligned[indices]
-        
-        tree = KDTree(Q)
-        dists, nn_indices = tree.query(P_samp, k=1)
-        Q_nn = Q[nn_indices]
-        
-        for i in range(len(P_samp)):
-            p = P_samp[i]
-            q = Q_nn[i]
-            dist = dists[i]
-            
-            color = 'green' if dist < threshold else 'red'
-            alpha = 0.6 if dist < threshold else 0.2
-            
-            ax.plot([p[0], q[0]], [p[1], q[1]], [p[2], q[2]], c=color, linewidth=0.5, alpha=alpha)
+    ax.scatter(P[:, 0], P[:, 1], P[:, 2], s=3, c='blue', alpha=0.3, label='Source')
+    ax.scatter(Q[:, 0], Q[:, 1], Q[:, 2], s=3, c='orange', alpha=0.3, label='Target')
+    
+    if g_p is not None:
+        draw_gravity_arrow(ax, np.mean(P, axis=0), g_p, 'blue', "g_P", scale)
+    if g_q is not None:
+        draw_gravity_arrow(ax, np.mean(Q, axis=0), g_q, 'red', "g_Q", scale)
+
+    ax.set_title(f"{title}\n{metrics_str}" if metrics_str else title, fontsize=12, color=color_title, fontweight='bold')
+    set_axes_equal_union(ax, all_pts)
 
 def visualize_samples(ckpt_path, loader, num_samples=5):
-    print("Processing samples from DataLoader...")
+    print(f"Processing samples: Standard ICP (Real Data Loader Input)...")
     save_dir = os.path.join(ckpt_path, "results")
     os.makedirs(save_dir, exist_ok=True)
     
-    try:
-        batch = next(iter(loader)) 
-    except StopIteration:
-        return
-
+    try: batch = next(iter(loader)) 
+    except StopIteration: return
+    
     src_batch = batch['p'].numpy() 
-    tgt_batch = batch['q'].numpy()
-    R_gt_batch = batch['R_pq'].numpy()
-    t_gt_batch = batch['t_pq'].numpy()
+    if src_batch.shape[1] == 3: src_batch = src_batch.transpose(0, 2, 1)
     
-    # [New] Gravity Vectors from Batch
-    g_p_batch = batch['gravity_p'].numpy()
-    g_q_batch = batch['gravity_q'].numpy()
+    grav_p_batch = batch['gravity_p'].numpy()
+    grav_q_batch = batch['gravity_q'].numpy()
     
-    if src_batch.shape[1] == 3:
-        src_batch = src_batch.transpose(0, 2, 1)
-        tgt_batch = tgt_batch.transpose(0, 2, 1)
+    algo_names = ["Standard ICP"]
+    stats = {name: [] for name in algo_names}
 
-    for i in range(min(len(src_batch), num_samples)):
+    actual_samples = min(len(src_batch), num_samples)
+    
+    for i in range(actual_samples):
+        # [Correct Data Loading] No hardcoded transformation here!
         P_raw = src_batch[i]
-        Q = tgt_batch[i]
-        R_gt = R_gt_batch[i]
-        t_gt = t_gt_batch[i]
-        g_p = g_p_batch[i] # Source Gravity
-        g_q = g_q_batch[i] # Target Gravity
         
-        # Hard Mode: No Initialization
-        t_init_vec = np.zeros(3)
+        # Load Q from dataset directly (Respects partial overlap settings)
+        Q = batch['q'][i].numpy()
+        if Q.shape[0] == 3: Q = Q.T
+            
+        g_p = grav_p_batch[i]
+        g_q = grav_q_batch[i]
+        
+        # Load GT for metrics
+        R_gt = batch['R_pq'][i].numpy()
+        t_gt = batch['t_pq'][i].numpy()
+        
+        # P_gt is where P should be after perfect transformation
+        # Note: If P and Q are different crops, P_gt will overlap with Q but not match point-to-point.
+        P_gt = (R_gt @ P_raw.T).T + t_gt
+        
+        # --- [Prep] Gravity Alignment Visualization ---
+        R_grav = GeometryUtils.get_gravity_rotation(g_p, g_q)
+        
+        center_P = np.mean(P_raw, axis=0)
+        center_Q = np.mean(Q, axis=0)
+        P_grav_aligned = ((R_grav @ (P_raw - center_P).T).T) + center_Q
+        g_p_aligned = R_grav @ g_p
 
-        # Parameter 계산
-        resolution = compute_resolution(P_raw)
-        ir_thresh = 3.0 * resolution 
-        icp_dist_thresh = 5.0 * resolution
+        # --- Solver ---
+        solver = StandardICPSolver(P_raw, Q)
+        tree = KDTree(solver.P_centered); d, _ = tree.query(solver.P_centered[:100], k=2)
+        ir_thresh = 3.0 * np.mean(d[:, 1])
         
-        # --- [ICP 수행] ---
-        norm_P = calculatenormal(P_raw, k=20)
-        norm_Q = calculatenormal(Q, k=20)
+        gt_str = f"Rot: {np.degrees(np.arccos(np.clip((np.trace(R_gt)-1)/2, -1, 1))):.1f}°"
         
-        R_icp, t_icp, _ = run_icp(
-            P_raw, Q, method="p2p", normals_P=norm_P, normals_Q=norm_Q,
-            max_iter=60, tol=1e-6, dist_thresh=icp_dist_thresh,
-            R_init=np.eye(3), t_init=t_init_vec.reshape(3,1), verbose=False
-        )
+        # --- Run Standard ICP ---
+        P_std, R_std, t_std = solver.register_standard()
         
-        P_aligned = (R_icp @ P_raw.T).T + t_icp.flatten()
-        
-        # --- [평가 지표 계산] ---
-        rot_err, trans_err = calculate_errors(R_icp, t_icp.flatten(), R_gt, t_gt)
-        tree = KDTree(Q)
-        dists, _ = tree.query(P_aligned, k=1)
-        inlier_ratio = np.mean(dists < ir_thresh) * 100.0
-        
-        # --- [시각화 준비] ---
-        fig = plt.figure(figsize=(24, 10))
-        
-        # 물체 크기 계산 (화살표 길이 결정을 위해)
-        scale_p = (P_raw.max(axis=0) - P_raw.min(axis=0)).max() * 0.6
-        scale_q = (Q.max(axis=0) - Q.min(axis=0)).max() * 0.6
-        
-        # Fig 1: P (Centered) + Gravity P
-        ax1 = fig.add_subplot(1, 3, 1, projection='3d')
-        P_center = P_raw - np.mean(P_raw, axis=0) 
-        ax1.scatter(P_center[:, 0], P_center[:, 1], P_center[:, 2], s=2, c='blue', alpha=0.5)
-        # [Visual] g_p 그리기 (중심에서 시작)
-        draw_gravity_arrow(ax1, [0,0,0], g_p, 'black', '$g_p$', scale_factor=scale_p)
-        
-        ax1.set_title(f"1. Source P (Input)\nPoints: {len(P_raw)}", fontsize=14)
-        ax1.set_axis_off()
-        set_axes_equal(ax1, P_center)
-        
-        # Fig 2: Q (Centered) + Gravity Q
-        ax2 = fig.add_subplot(1, 3, 2, projection='3d')
-        Q_center = Q - np.mean(Q, axis=0)
-        ax2.scatter(Q_center[:, 0], Q_center[:, 1], Q_center[:, 2], s=2, c='orange', alpha=0.5)
-        # [Visual] g_q 그리기
-        draw_gravity_arrow(ax2, [0,0,0], g_q, 'red', '$g_q$', scale_factor=scale_q)
-        
-        ax2.set_title(f"2. Target Q (Input)\nPoints: {len(Q)}", fontsize=14)
-        ax2.set_axis_off()
-        set_axes_equal(ax2, Q_center)
-        
-        # Fig 3: Alignment Result + Gravity Alignment Check
-        ax3 = fig.add_subplot(1, 3, 3, projection='3d')
-        draw_alignment_result(ax3, P_aligned, Q, threshold=ir_thresh)
-        
-        # [Visual] 결과 확인용 중력 그리기
-        # 1. Target Q의 중력 (빨강) - Q의 무게중심에서
-        centroid_Q = np.mean(Q, axis=0)
-        draw_gravity_arrow(ax3, centroid_Q, g_q, 'red', '$g_q$', scale_factor=scale_q)
-        
-        # 2. ICP로 회전된 P의 중력 (파랑) - P_aligned의 무게중심에서
-        #    g_p_aligned = R_icp * g_p
-        g_p_aligned = R_icp @ g_p
-        centroid_P_aligned = np.mean(P_aligned, axis=0)
-        # 살짝 옆으로 이동해서 겹치지 않게 보이도록 함
-        offset = np.array([0.1, 0.1, 0.1]) * scale_q 
-        draw_gravity_arrow(ax3, centroid_P_aligned + offset, g_p_aligned, 'blue', "$g_p'$", scale_factor=scale_q)
-        
-        ax3.set_title(f"3. ICP Result (Gravity Check)\nR_err: {rot_err:.2f}°, Inlier: {inlier_ratio:.1f}%", fontsize=14)
-        ax3.legend(loc='upper right', fontsize='small')
-        ax3.set_axis_off()
-        
-        all_pts = np.concatenate([P_aligned, Q], axis=0)
-        set_axes_equal(ax3, all_pts)
+        met_std = GeometryUtils.compute_full_metrics(P_std, P_gt, Q, R_std, R_gt, t_std, t_gt, ir_thresh)
+        stats["Standard ICP"].append(met_std)
 
-        plt.tight_layout()
-        save_path = os.path.join(save_dir, f"icp_result_{i}.png")
-        plt.savefig(save_path, dpi=150)
-        plt.close()
-        print(f"Saved: {save_path} | R_err: {rot_err:.2f}°, IR: {inlier_ratio:.1f}%")
+        # --- Visualization (2x2 Layout) ---
+        fig = plt.figure(figsize=(15, 15))
+        
+        # 1. Initial State
+        ax1 = fig.add_subplot(2, 2, 1, projection='3d')
+        draw_result(ax1, solver.P_centered, Q, g_p, g_q, "1. Initial (Centered)", ir_thresh=ir_thresh)
+        
+        # 2. Gravity Aligned
+        ax2 = fig.add_subplot(2, 2, 2, projection='3d')
+        draw_result(ax2, P_grav_aligned, Q, g_p_aligned, g_q, "2. Gravity Aligned", color_title='green', ir_thresh=ir_thresh)
+        
+        # 3. Ground Truth
+        ax3 = fig.add_subplot(2, 2, 3, projection='3d')
+        draw_result(ax3, P_gt, Q, g_q, g_q, "3. Ground Truth (Target Pose)", gt_str, ir_thresh=ir_thresh)
+        
+        # 4. Standard ICP Result
+        ax4 = fig.add_subplot(2, 2, 4, projection='3d')
+        met_str = f"RRE:{met_std[0]:.1f}, RTE:{met_std[1]:.3f}"
+        color = 'red' if met_std[3] < 50 else 'blue'
+        draw_result(ax4, P_std, Q, R_std@g_p, g_q, "4. Standard ICP", met_str, color, ir_thresh=ir_thresh)
+        
+        plt.tight_layout(); plt.savefig(os.path.join(save_dir, f"result_{i}.png"), dpi=100); plt.close()
+        print(f"Sample {i} | {gt_str} | Std ICP RRE: {met_std[0]:.2f}")
+
+    # --- Summary ---
+    print("\n" + "="*90)
+    print(f" FINAL SUMMARY (Over {actual_samples} samples)")
+    print("="*90)
+    print(f"{'Algorithm':<20} | {'Succ Rate (%)':<15} | {'Mean RRE':<10} | {'Mean RTE':<10} | {'Mean IR':<10}")
+    print("-" * 90)
+    for name in algo_names:
+        arr = np.array(stats[name])
+        success_mask = (arr[:, 0] < 5.0) & (arr[:, 1] < 0.1)
+        success_rate = np.mean(success_mask) * 100.0
+        mean_rre = np.mean(arr[:, 0])
+        mean_rte = np.mean(arr[:, 1])
+        mean_ir  = np.mean(arr[:, 3])
+        print(f"{name:<20} | {success_rate:<15.1f} | {mean_rre:<10.2f} | {mean_rte:<10.3f} | {mean_ir:<10.1f}")
+    print("="*90)
 
 def main(ckpt):
     yaml_path = os.path.join(os.path.dirname(ckpt), '.hydra', 'config.yaml')
     cfg = OmegaConf.load(yaml_path)
     
-    if not hasattr(cfg.data, 'partial_overlap'):
-        cfg.data.partial_overlap = True
+    # Load config as-is. Data generation is now fully delegated to RegistrationDataset via loader
+    if not hasattr(cfg.data, 'partial_overlap'): cfg.data.partial_overlap = True
     
-    print("Loading Dataset...")
-    test_loader = data_loader(cfg)
-    
-    # ckpt 경로의 상위 폴더를 기준으로 results 저장
-    visualize_samples(os.path.dirname(ckpt), test_loader, num_samples=5)
+    _, test_loader = data_loader(cfg)
+    visualize_samples(os.path.dirname(ckpt), test_loader, num_samples=50)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

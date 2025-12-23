@@ -88,7 +88,7 @@ def get_rotation_from_vectors(u, v):
 def train_one_epoch(model, data_loader, optimizer, loss_fn, epoch, metric, cfg):
     
     model.train() 
-    pbar = tqdm(data_loader['train'], desc=f"Epoch [{epoch}] Training", leave=True)
+    pbar = tqdm(data_loader['train'], desc=f"Epoch [{epoch}] Training", leave=True, ncols=0)
     
     AvgMeter_train = metric['train']
     
@@ -125,7 +125,7 @@ def test_one_epoch(model, test_loader, loss_fn, metric, cfg, epoch=0, visualize=
     model.eval()
     AvgMeter_val = metric['val']
     
-    pbar = tqdm(test_loader, desc=f"Epoch [{epoch}] Validation", leave=True)
+    pbar = tqdm(test_loader, desc=f"Epoch [{epoch}] Validation", leave=True, ncols=0)
     
     # visualize=True일 때 결과를 저장할 리스트
     if visualize:
