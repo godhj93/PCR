@@ -178,7 +178,7 @@ class RegistrationDataset(Dataset):
         sort_idx = np.argsort(proj)
         
         # 3. 유지할 비율 결정 (0.1 ~ 1.0) -> 즉 0~90% 잘려나감
-        keep_ratio = np.random.uniform(1.0, 1.0)
+        keep_ratio = np.random.uniform(0.8, 1.0)
         num_keep = int(len(points) * keep_ratio)
         
         # 4. Slicing
