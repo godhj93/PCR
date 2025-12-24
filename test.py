@@ -301,29 +301,28 @@ def visualize_samples(ckpt_path, loader, num_samples=50):
             # ---------------------------------------
 
             # --- Visualization (생략 - 동일함) ---
-            if total_processed < 5:
-                # (기존 시각화 코드 유지)
-                fig = plt.figure(figsize=(20, 10))
-                ax1 = fig.add_subplot(2, 4, 1, projection='3d')
-                draw_result(ax1, solver.P_raw+(solver.centroid_Q-solver.centroid_P), Q, g_p, g_q, "1. Input", ir_thresh=ir_thresh)
-                ax2 = fig.add_subplot(2, 4, 2, projection='3d')
-                draw_result(ax2, P_gt, Q, g_q, g_q, "2. GT", gt_str, ir_thresh=ir_thresh)
-                ax3 = fig.add_subplot(2, 4, 3, projection='3d'); m = stats["Standard"][-1]
-                draw_result(ax3, results["Standard"][0], Q, results["Standard"][1]@g_p, g_q, "3. Standard", f"RRE:{m[0]:.1f}", 'black', ir_thresh)
-                ax4 = fig.add_subplot(2, 4, 4, projection='3d'); m = stats["Gravity"][-1]
-                draw_result(ax4, results["Gravity"][0], Q, results["Gravity"][1]@g_p, g_q, "4. Gravity", f"RRE:{m[0]:.1f}", 'blue', ir_thresh)
-                ax5 = fig.add_subplot(2, 4, 5, projection='3d'); m = stats["YawSearch"][-1]
-                draw_result(ax5, results["YawSearch"][0], Q, results["YawSearch"][1]@g_p, g_q, "5. YawSearch", f"RRE:{m[0]:.1f}", 'purple', ir_thresh)
-                ax6 = fig.add_subplot(2, 4, 6, projection='3d'); m = stats["Inc"][-1]
-                draw_result(ax6, results["Inc"][0], Q, results["Inc"][1]@g_p, g_q, "6. Inc", f"RRE:{m[0]:.1f}", 'magenta', ir_thresh)
-                ax7 = fig.add_subplot(2, 4, 7, projection='3d'); m = stats["Fused"][-1]
-                col = 'green' if m[0] < 5.0 and m[1] < 0.1 else 'red'
-                draw_result(ax7, results["Fused"][0], Q, results["Fused"][1]@g_p, g_q, "7. Fused", f"RRE:{m[0]:.1f}", col, ir_thresh)
-                ax8 = fig.add_subplot(2, 4, 8, projection='3d'); R_g = GeometryUtils.get_gravity_rotation(g_p, g_q)
-                P_g_view = (R_g @ P_raw.T).T + (solver.centroid_Q - np.mean(P_raw,0))
-                draw_result(ax8, P_g_view, Q, R_g@g_p, g_q, "8. Gravity View", color_title='gray', ir_thresh=ir_thresh)
-                plt.tight_layout(); plt.savefig(os.path.join(save_dir, f"result_{total_processed}.png"), dpi=100); plt.close()
             
+            fig = plt.figure(figsize=(20, 10))
+            ax1 = fig.add_subplot(2, 4, 1, projection='3d')
+            draw_result(ax1, solver.P_raw+(solver.centroid_Q-solver.centroid_P), Q, g_p, g_q, "1. Input", ir_thresh=ir_thresh)
+            ax2 = fig.add_subplot(2, 4, 2, projection='3d')
+            draw_result(ax2, P_gt, Q, g_q, g_q, "2. GT", gt_str, ir_thresh=ir_thresh)
+            ax3 = fig.add_subplot(2, 4, 3, projection='3d'); m = stats["Standard"][-1]
+            draw_result(ax3, results["Standard"][0], Q, results["Standard"][1]@g_p, g_q, "3. Standard", f"RRE:{m[0]:.1f}", 'black', ir_thresh)
+            ax4 = fig.add_subplot(2, 4, 4, projection='3d'); m = stats["Gravity"][-1]
+            draw_result(ax4, results["Gravity"][0], Q, results["Gravity"][1]@g_p, g_q, "4. Gravity", f"RRE:{m[0]:.1f}", 'blue', ir_thresh)
+            ax5 = fig.add_subplot(2, 4, 5, projection='3d'); m = stats["YawSearch"][-1]
+            draw_result(ax5, results["YawSearch"][0], Q, results["YawSearch"][1]@g_p, g_q, "5. YawSearch", f"RRE:{m[0]:.1f}", 'purple', ir_thresh)
+            ax6 = fig.add_subplot(2, 4, 6, projection='3d'); m = stats["Inc"][-1]
+            draw_result(ax6, results["Inc"][0], Q, results["Inc"][1]@g_p, g_q, "6. Inc", f"RRE:{m[0]:.1f}", 'magenta', ir_thresh)
+            ax7 = fig.add_subplot(2, 4, 7, projection='3d'); m = stats["Fused"][-1]
+            col = 'green' if m[0] < 5.0 and m[1] < 0.1 else 'red'
+            draw_result(ax7, results["Fused"][0], Q, results["Fused"][1]@g_p, g_q, "7. Fused", f"RRE:{m[0]:.1f}", col, ir_thresh)
+            ax8 = fig.add_subplot(2, 4, 8, projection='3d'); R_g = GeometryUtils.get_gravity_rotation(g_p, g_q)
+            P_g_view = (R_g @ P_raw.T).T + (solver.centroid_Q - np.mean(P_raw,0))
+            draw_result(ax8, P_g_view, Q, R_g@g_p, g_q, "8. Gravity View", color_title='gray', ir_thresh=ir_thresh)
+            plt.tight_layout(); plt.savefig(os.path.join(save_dir, f"result_{total_processed}.png"), dpi=100); plt.close()
+        
             total_processed += 1
 
     # --- Summary (동일함) ---

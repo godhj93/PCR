@@ -5,13 +5,10 @@ defaults:
   - override hydra/job_logging: default
   - override hydra/hydra_logging: default
 
-
-# 아래처럼 model_name을 명시적으로 관리하거나, model 변수를 직접 수정합니다.
 model_name: ${hydra:runtime.choices.model}
 
 hydra:
   run:
-    # ${model} 대신 ${model_name}을 사용합니다.
     dir: runs/${data.name}/${now:%Y-%m-%d}/${model_name}_${now:%Y-%m-%d-%H-%M-%S}/
   sweep:
     dir: runs/${data.name}/${now:%Y-%m-%d}
@@ -35,9 +32,10 @@ data:
   num_points: 1024
   gaussian_noise: 0.01
   unseen: false
-  factor: 1
+  factor: 4
   num_workers: 8
-  partial_overlap: False
+  partial_overlap: True
+  keep_ratio: 0.8
   
 loss:
   _target_: utils.loss.VMFLoss

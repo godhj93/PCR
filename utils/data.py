@@ -87,7 +87,8 @@ class RegistrationDataset(Dataset):
                  gaussian_noise: bool = False, 
                  unseen: bool = False, 
                  factor: float = 1,
-                 partial_overlap: bool = True):
+                 partial_overlap: bool = True,
+                 keep_ratio: float = 0.1):
         
         self.dataset_name = dataset_name.lower()
         self.num_points = num_points
@@ -96,6 +97,7 @@ class RegistrationDataset(Dataset):
         self.unseen = unseen
         self.factor = factor
         self.partial_overlap = partial_overlap 
+        self.keep_ratio = keep_ratio    
         
         # ! Gravity 설정 (World frame에서의 중력 방향)
         # ! 여기서는 z-축 음의 방향을 "중력"으로 정의 (예: g_world = (0, 0, -1))
@@ -178,7 +180,8 @@ class RegistrationDataset(Dataset):
         sort_idx = np.argsort(proj)
         
         # 3. 유지할 비율 결정 (0.1 ~ 1.0) -> 즉 0~90% 잘려나감
-        keep_ratio = np.random.uniform(0.8, 1.0)
+        
+        keep_ratio = np.random.uniform(self.keep_ratio, 1.0)
         num_keep = int(len(points) * keep_ratio)
         
         # 4. Slicing
@@ -188,13 +191,9 @@ class RegistrationDataset(Dataset):
         # 5. Resampling (배치 처리를 위해 원래 점 개수로 복원)
         if len(cropped_points) < self.num_points:
             
-            # =================================================================
-            # [추가해야 할 부분] 여기가 빠져 있습니다!
-            # =================================================================
             if self.partition != 'train' and seed_idx is not None:
                 # 같은 seed_idx를 쓰면 위쪽 패턴과 동기화되어 편향될 수 있으므로 +1을 해줍니다.
                 np.random.seed(seed_idx + 1) 
-            # =================================================================
 
             choice_idx = np.random.choice(len(cropped_points), self.num_points, replace=True)
             resampled_points = cropped_points[choice_idx]
@@ -203,12 +202,8 @@ class RegistrationDataset(Dataset):
             resampled_points = resampled_points + jitter.astype('float32')
             
         else:
-            # =================================================================
-            # [추가해야 할 부분] 여기도 추가해주세요.
-            # =================================================================
             if self.partition != 'train' and seed_idx is not None:
                 np.random.seed(seed_idx + 2) # 다른 값으로 시드 고정
-            # =================================================================
 
             choice_idx = np.random.choice(len(cropped_points), self.num_points, replace=False)
             resampled_points = cropped_points[choice_idx]
@@ -365,7 +360,8 @@ def data_loader(cfg):
             partition='train',
             gaussian_noise=cfg.data.gaussian_noise,
             unseen=cfg.data.unseen,
-            factor=cfg.data.factor
+            factor=cfg.data.factor,
+            keep_ratio=cfg.data.keep_ratio
         )
         test_dataset = RegistrationDataset(
             dataset_name=dataset_name,
@@ -374,7 +370,8 @@ def data_loader(cfg):
             partition='test',
             gaussian_noise=False,
             unseen=cfg.data.unseen,
-            factor=cfg.data.factor
+            factor=cfg.data.factor,
+            keep_ratio=cfg.data.keep_ratio
         )
         
     elif dataset_name == 'bunny':
@@ -392,7 +389,8 @@ def data_loader(cfg):
             partition='train',
             gaussian_noise=cfg.data.gaussian_noise,
             unseen=cfg.data.unseen,
-            factor=cfg.data.factor
+            factor=cfg.data.factor,
+            keep_ratio=cfg.data.keep_ratio
         )
         test_dataset = RegistrationDataset(
             dataset_name=dataset_name,
@@ -401,7 +399,8 @@ def data_loader(cfg):
             partition='test',
             gaussian_noise=False,
             unseen=cfg.data.unseen,
-            factor=cfg.data.factor
+            factor=cfg.data.factor,
+            keep_ratio=cfg.data.keep_ratio
         )
     else:
         raise ValueError(f"Unsupported dataset: {dataset_name}. 'modelnet40' 또는 'bunny'여야 합니다.")
