@@ -88,7 +88,7 @@ def get_rotation_from_vectors(u, v):
 def train_one_epoch(model, data_loader, optimizer, loss_fn, epoch, metric, cfg):
     
     model.train() 
-    pbar = tqdm(data_loader['train'], desc=f"Epoch [{epoch}] Training", leave=True, ncols=0)
+    pbar = tqdm(data_loader['train'], ncols=0)
     
     AvgMeter_train = metric['train']
     
@@ -113,7 +113,7 @@ def train_one_epoch(model, data_loader, optimizer, loss_fn, epoch, metric, cfg):
         
         AvgMeter_train.update(loss.item(), q.size(0))
         
-        pbar.set_description(f"Epoch [{epoch}] Train Loss: {AvgMeter_train.avg:.4f}, kappa: {(kappa_p.mean() + kappa_q.mean()).item() / 2:.4f}")
+        pbar.set_description(f"Epoch [{epoch} / {cfg.training.epochs}] Train Loss: {AvgMeter_train.avg:.4f}, kappa: {(kappa_p.mean() + kappa_q.mean()).item() / 2:.4f}")
         
     # Validation
     val_loss = test_one_epoch(model, data_loader['test'], loss_fn, metric, cfg, epoch)
@@ -125,7 +125,7 @@ def test_one_epoch(model, test_loader, loss_fn, metric, cfg, epoch=0, visualize=
     model.eval()
     AvgMeter_val = metric['val']
     
-    pbar = tqdm(test_loader, desc=f"Epoch [{epoch}] Validation", leave=True, ncols=0)
+    pbar = tqdm(test_loader, ncols=0)
     
     # visualize=True일 때 결과를 저장할 리스트
     if visualize:
@@ -155,7 +155,7 @@ def test_one_epoch(model, test_loader, loss_fn, metric, cfg, epoch=0, visualize=
             
             AvgMeter_val.update(loss.item(), q.size(0))
             
-            pbar.set_description(f"Epoch [{epoch}] Val Loss: {AvgMeter_val.avg:.4f}, kappa: {(kappa_p.mean() + kappa_q.mean()).item() / 2:.4f}")
+            pbar.set_description(f"Epoch [{epoch} / {cfg.training.epochs}] Val Loss: {AvgMeter_val.avg:.4f}, kappa: {(kappa_p.mean() + kappa_q.mean()).item() / 2:.4f}")
             
             # visualize=True일 때 결과 저장
             if visualize:
