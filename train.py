@@ -43,13 +43,12 @@ def train(cfg: DictConfig) -> None:
     loss_fn = hydra.utils.instantiate(cfg.loss)
     
     log.info("===== Training Start =====")
-    pbar = tqdm(range(1, cfg.training.epochs + 1), desc="Training Epochs")
     
     AvgMeter_train = AverageMeter()
     AvgMeter_val = AverageMeter()
     best_loss = float('inf')
     
-    for epoch in pbar:
+    for epoch in range(1, cfg.training.epochs + 1):
         
         AvgMeter_train.reset()
         AvgMeter_val.reset()
