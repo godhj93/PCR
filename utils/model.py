@@ -112,7 +112,8 @@ class PointNet_VN_Gravity_Bayes_v2(nn.Module):
         
         # Normal Estimator
         self.normal_estimator = NormalEstimator(k=30)
-        
+        self.p_normals = None
+        self.q_normals = None
         # ==========================================
         # Mode 1: Equivariant (Vector Neuron)
         # ==========================================
@@ -186,7 +187,7 @@ class PointNet_VN_Gravity_Bayes_v2(nn.Module):
         B, D, N = x.shape
         if D == 3:
             x = self.normal_estimator(x) # [B, 6, N]
-        
+            normals = x[:, 3:, :].contiguous() # [B, 3, N]
         if self.mode == 'equi':
             x = x.view(B, 2, 3, N)
             x = self.vn_fc1(x)
@@ -196,7 +197,7 @@ class PointNet_VN_Gravity_Bayes_v2(nn.Module):
             x = self.std_fc1(x)
             x = self.std_fc2(x)
             x = self.std_fc3(x) # [B, 1024, N]
-        return x
+        return x, normals
 
     def process_interaction(self, f_p, f_q):
         """
@@ -255,8 +256,11 @@ class PointNet_VN_Gravity_Bayes_v2(nn.Module):
 
     def forward(self, p, q):
         # 1. Backbone
-        f_p = self.extract_feat(p) 
-        f_q = self.extract_feat(q)
+        f_p, n_p = self.extract_feat(p) 
+        f_q, n_q = self.extract_feat(q)
+        
+        self.p_normals = n_p
+        self.q_normals = n_q
         
         # 2. Downsampling
         stride = 16 
@@ -288,6 +292,65 @@ class PointNet_VN_Gravity_Bayes_v2(nn.Module):
         
         return (mu_p, kappa_p), (mu_q, kappa_q)
         
+    def check_correspondence_validity(self, batch_idx, P_indices, Q_indices, g_p, kappa_p, g_q, kappa_q, chi2_thresh=9.0):
+        """
+        Analytic Covariance Hypothesis Testing with Robustness Floor
+        """
+        if self.p_normals is None or self.q_normals is None:
+            # Fallback
+            return np.ones(len(P_indices), dtype=bool), np.zeros(len(P_indices))
+
+        # 1. Retrieve Stored Normals
+        # Transpose to (N, 3)
+        curr_p_normals = self.p_normals[batch_idx].transpose(0, 1) 
+        curr_q_normals = self.q_normals[batch_idx].transpose(0, 1) 
+        
+        # 2. Select Correspondences (Indices handling)
+        dev = curr_p_normals.device
+        if not isinstance(P_indices, torch.Tensor): P_indices = torch.tensor(P_indices, device=dev)
+        if not isinstance(Q_indices, torch.Tensor): Q_indices = torch.tensor(Q_indices, device=dev)
+        
+        n_p = curr_p_normals[P_indices] 
+        n_q = curr_q_normals[Q_indices] 
+        
+        # 3. Inclination & Geometric Sensitivity
+        # Ensure g_p, g_q are normalized
+        I_p = torch.matmul(n_p, g_p)
+        I_q = torch.matmul(n_q, g_q)
+        
+        # sin^2 term (Geometric Sensitivity)
+        sin2_p = torch.clamp(1.0 - I_p**2, min=1e-6)
+        sin2_q = torch.clamp(1.0 - I_q**2, min=1e-6)
+        
+        # 4. Geometric Covariance (Analytic)
+        dot_normals = (n_p * n_q).sum(dim=1)
+        cov_numerator = dot_normals - (I_p * I_q)
+        
+        # [CRITICAL FIX] Additive Noise Model (Robustness Floor)
+        # base_variance represents sensor noise + ICP misalignment tolerance.
+        # 0.01 corresponds to allowing roughly ~0.1 difference in inclination (like DNN)
+        # when kappa is extremely high.
+        base_variance = 0.01 
+        
+        term_p = sin2_p / (kappa_p + 1e-6)
+        term_q = sin2_q / (kappa_q + 1e-6)
+        term_cov = 2.0 * cov_numerator / (torch.sqrt(kappa_p * kappa_q) + 1e-6)
+        
+        # Pure Analytic Variance
+        sigma_sq_analytic = term_p + term_q - term_cov
+        
+        # Final Variance = Analytic + Base Floor
+        # This prevents division by zero-ish values when kappa is huge.
+        sigma_sq_total = torch.clamp(sigma_sq_analytic, min=1e-8) + base_variance
+        
+        # 5. Test
+        residual_sq = (I_p - I_q)**2
+        M2_score = residual_sq / sigma_sq_total
+        
+        valid_mask = M2_score < chi2_thresh
+        
+        return valid_mask.cpu().numpy(), M2_score.cpu().numpy()
+    
 class DGCNN_VN_Gravity(nn.Module):
     def __init__(self, k=20, normal_channel=False):
         super(DGCNN_VN_Gravity, self).__init__()
