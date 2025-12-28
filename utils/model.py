@@ -58,62 +58,25 @@ class PointNet_VN_Gravity_Bayes(PointNet_VN_Gravity):
         
         return mu, kappa
     
-class PointNet_VN_Gravity_Bayes_Joint(PointNet_VN_Gravity_Bayes):
-    def __init__(self, pooling, normal_channel=True):
-        super(PointNet_VN_Gravity_Bayes_Joint, self).__init__(pooling, normal_channel)
-    
-    def forward(self, p, q):
-        # 1. Feature Extraction (Siamese)
-        feat_p = self.feat(p)  # (B, 1024//3, 3)
-        feat_q = self.feat(q)  # (B, 1024//3, 3)
-        
-        # 2. Shared MLP (Backbone)
-        feat_p = self.vn_fc1(feat_p)
-        feat_p = self.vn_fc2(feat_p) # (B, 128, 3)
-        
-        feat_q = self.vn_fc1(feat_q)
-        feat_q = self.vn_fc2(feat_q) # (B, 128, 3)
-        
-        # -----------------------------------------------------------
-        # 3. Mu Branch (Independent)
-        # -----------------------------------------------------------
-        mu_p = self.vn_fc3(feat_p)
-        mu_p = F.normalize(mu_p.view(-1, 3), p=2, dim=1)
-        
-        mu_q = self.vn_fc3(feat_q)
-        mu_q = F.normalize(mu_q.view(-1, 3), p=2, dim=1)
-        
-        # -----------------------------------------------------------
-        # 4. Kappa Branch (Joint)
-        # -----------------------------------------------------------
-        inv_feat_p = self.vn_invariant(feat_p) # (B, 128)
-        inv_feat_q = self.vn_invariant(feat_q) # (B, 128)
-        
-        combined_inv_feat = inv_feat_p + inv_feat_q # (B, 128)
-        
-        kappa = self.kappa_mlp(combined_inv_feat)
-        kappa = kappa + 1.0
-        
-        # 반환: P의 중력, Q의 중력, 그리고 공통된 확신도
-        return mu_p, mu_q, kappa
-    
 class PointNet_VN_Gravity_Bayes_v2(nn.Module):
-    def __init__(self, pooling='mean', normal_channel=False, mode='equi'):
+    def __init__(self, pooling='attentive', normal_channel=False, mode='equi', stride=16):
         """
         Args:
-            mode: 'equi' (Vector Neuron + Gating) 
-                  or 'normal' (Standard PointNet + Self/Cross Attention)
+            pooling: 'mean', 'max', or 'attentive' 
+            mode: 'equi' (Vector Neuron) or 'normal' (Standard PointNet)
         """
         super(PointNet_VN_Gravity_Bayes_v2, self).__init__()
         
         self.pooling = pooling
         self.mode = mode
         self.feat_dim = 1024
+        self.stride = stride
         
         # Normal Estimator
         self.normal_estimator = NormalEstimator(k=30)
         self.p_normals = None
         self.q_normals = None
+        
         # ==========================================
         # Mode 1: Equivariant (Vector Neuron)
         # ==========================================
@@ -125,13 +88,21 @@ class PointNet_VN_Gravity_Bayes_v2(nn.Module):
             self.vn_fc2 = VNLinearLeakyReLU(64, 64, dim=4, negative_slope=0.2)
             self.vn_fc3 = VNLinearLeakyReLU(64, self.feat_dim, dim=4, negative_slope=0.2)
             
-            # Interaction (VN은 구조상 Gating이 효율적)
+            # Interaction
             self.vn_self_attn = VN_Attention(self.feat_dim)
             self.vn_cross_gating = VN_Cross_Gating(self.feat_dim)
             
-            # Pooling & Invariant
-            if pooling == 'max':
+            if self.pooling == 'attentive':
+                raise ValueError("Attentive pooling for 'equi' mode is not implemented in this version.")
+                self.vn_invariant_layer = VNInvariant(self.feat_dim)
+                self.attention_mlp = nn.Sequential(
+                    nn.Linear(self.feat_dim * 3, 128),
+                    nn.LeakyReLU(0.2),
+                    nn.Linear(128, 1) 
+                )
+            elif self.pooling == 'max':
                 self.vn_pool = VNMaxPool(self.feat_dim)
+                
             self.vn_invariant = VNInvariant(self.feat_dim)
             
             # Heads
@@ -139,108 +110,133 @@ class PointNet_VN_Gravity_Bayes_v2(nn.Module):
                 VNLinearLeakyReLU(self.feat_dim, self.feat_dim, dim=3, negative_slope=0.0),
                 VNLinear(self.feat_dim, 1)
             )
-            # VNInvariant 출력(feat_dim * 3)에 맞춘 MLP
             self.kappa_mlp = nn.Sequential(
-                nn.Linear(self.feat_dim * 3, 128), 
-                nn.LeakyReLU(0.2),
-                nn.Linear(128, 64), 
-                nn.LeakyReLU(0.2), 
-                nn.Linear(64, 1), 
-                nn.Softplus()
+                nn.Linear(self.feat_dim * 3, 128), nn.LeakyReLU(0.2),
+                nn.Linear(128, 64), nn.LeakyReLU(0.2),
+                nn.Linear(64, 1), nn.Softplus()
             )
 
         # ==========================================
-        # Mode 2: Normal (Standard NN + Transformer Attention)
+        # Mode 2: Normal (Standard NN)
         # ==========================================
         elif self.mode == 'normal':
-            std_in_channels = 6 # XYZ(3) + Normal(3)
+            std_in_channels = 9 # (XYZ + Sign-Invariant Normal Features)
             
-            # 1. Backbone (PointNet)
+            # Backbone
             self.std_fc1 = nn.Sequential(nn.Conv1d(std_in_channels, 64, 1), nn.BatchNorm1d(64), nn.LeakyReLU(0.2))
             self.std_fc2 = nn.Sequential(nn.Conv1d(64, 64, 1), nn.BatchNorm1d(64), nn.LeakyReLU(0.2))
             self.std_fc3 = nn.Sequential(nn.Conv1d(64, self.feat_dim, 1), nn.BatchNorm1d(self.feat_dim), nn.LeakyReLU(0.2))
             
-            # 2. Interaction (Standard Transformer Attention)
-            # Self Attention: 내 점들끼리의 관계 파악
+            # Interaction
             self.std_self_attn = nn.MultiheadAttention(embed_dim=self.feat_dim, num_heads=4, batch_first=True)
-            
-            # Cross Attention: 상대방 점들을 참조 (P queries Q)
             self.std_cross_attn = nn.MultiheadAttention(embed_dim=self.feat_dim, num_heads=4, batch_first=True)
+            
+            # [NEW] Attentive Pooling Components
+            if self.pooling == 'attentive':
+                self.attention_mlp = nn.Sequential(
+                    nn.Linear(self.feat_dim, 128),
+                    nn.LeakyReLU(0.2),
+                    nn.Linear(128, 1)
+                )
             
             # Heads
             self.std_mu_head = nn.Sequential(
-                nn.Linear(self.feat_dim, 512),
-                nn.LeakyReLU(0.2),
-                nn.Linear(512, 3) # 3D vector output
+                nn.Linear(self.feat_dim, 512), nn.LeakyReLU(0.2),
+                nn.Linear(512, 3) 
             )
-            # Global Pooling 출력(feat_dim)에 맞춘 MLP
             self.kappa_mlp = nn.Sequential(
-                nn.Linear(self.feat_dim, 128), 
-                nn.LeakyReLU(0.2),
-                nn.Linear(128, 64), 
-                nn.LeakyReLU(0.2), 
-                nn.Linear(64, 1), 
-                nn.Softplus()
+                nn.Linear(self.feat_dim, 128), nn.LeakyReLU(0.2),
+                nn.Linear(128, 64), nn.LeakyReLU(0.2),
+                nn.Linear(64, 1), nn.Softplus()
             )
 
     def extract_feat(self, x):
+        """
+        Extract features. 
+        For 'normal' mode, converts normals to sign-invariant outer product features (9 channels).
+        """
         B, D, N = x.shape
+        
+        # 1. Normal Estimation
         if D == 3:
-            x = self.normal_estimator(x) # [B, 6, N]
-            normals = x[:, 3:, :].contiguous() # [B, 3, N]
-        if self.mode == 'equi':
+            x = self.normal_estimator(x) 
+            
+        # Capture raw normals for Hypothesis Testing
+        normals = x[:, 3:, :].contiguous() 
+        
+        # 2. Mode-specific Feature Processing
+        if self.mode == 'normal':
+            # Sign-Invariant Transformation
+            pos = x[:, :3, :] 
+            n = x[:, 3:, :]   
+            
+            # Outer Product (n * n^T) terms
+            n_xx = n[:, 0:1, :] * n[:, 0:1, :]
+            n_yy = n[:, 1:2, :] * n[:, 1:2, :]
+            n_zz = n[:, 2:3, :] * n[:, 2:3, :]
+            n_xy = n[:, 0:1, :] * n[:, 1:2, :]
+            n_xz = n[:, 0:1, :] * n[:, 2:3, :]
+            n_yz = n[:, 1:2, :] * n[:, 2:3, :]
+            
+            # Concatenate to form 9-channel input
+            x = torch.cat([pos, n_xx, n_yy, n_zz, n_xy, n_xz, n_yz], dim=1) 
+            
+            x = self.std_fc1(x)
+            x = self.std_fc2(x)
+            x = self.std_fc3(x) 
+
+        elif self.mode == 'equi':
             x = x.view(B, 2, 3, N)
             x = self.vn_fc1(x)
             x = self.vn_fc2(x)
-            x = self.vn_fc3(x) # [B, 1024, 3, N]
-        elif self.mode == 'normal':
-            x = self.std_fc1(x)
-            x = self.std_fc2(x)
-            x = self.std_fc3(x) # [B, 1024, N]
+            x = self.vn_fc3(x) 
+            
         return x, normals
 
     def process_interaction(self, f_p, f_q):
-        """
-        Mode에 따른 Interaction 처리
-        Equi: VN Self Attn -> VN Cross Gating
-        Normal: Self Attn -> Cross Attn
-        """
         if self.mode == 'equi':
-            # 1. Self Interaction
             f_p = self.vn_self_attn(f_p)
             f_q = self.vn_self_attn(f_q)
-            
-            # 2. Cross Interaction (Gating)
             f_p_out = self.vn_cross_gating(x=f_p, y=f_q)
             f_q_out = self.vn_cross_gating(x=f_q, y=f_p)
-            
         elif self.mode == 'normal':
-            # Input: [B, C, N] -> [B, N, C] for MultiheadAttention
-            p_in = f_p.permute(0, 2, 1) 
-            q_in = f_q.permute(0, 2, 1)
-            
-            # 1. Self Attention (Residual)
-            # Query=P, Key=P, Value=P
+            p_in = f_p.permute(0, 2, 1); q_in = f_q.permute(0, 2, 1)
             p_self, _ = self.std_self_attn(p_in, p_in, p_in)
             q_self, _ = self.std_self_attn(q_in, q_in, q_in)
-            
-            p_in = p_in + p_self
-            q_in = q_in + q_self
-            
-            # 2. Cross Attention (Residual)
-            # P gets info from Q: Query=P, Key=Q, Value=Q
+            p_in = p_in + p_self; q_in = q_in + q_self
             p_cross, _ = self.std_cross_attn(query=p_in, key=q_in, value=q_in)
-            # Q gets info from P: Query=Q, Key=P, Value=P
             q_cross, _ = self.std_cross_attn(query=q_in, key=p_in, value=p_in)
-            
-            p_out = p_in + p_cross
-            q_out = q_in + q_cross
-            
-            # Back to [B, C, N]
-            f_p_out = p_out.permute(0, 2, 1)
-            f_q_out = q_out.permute(0, 2, 1)
-            
+            p_out = p_in + p_cross; q_out = q_in + q_cross
+            f_p_out = p_out.permute(0, 2, 1); f_q_out = q_out.permute(0, 2, 1)
         return f_p_out, f_q_out
+
+    def apply_pooling(self, feat):
+        
+        if self.pooling == 'attentive':
+            if self.mode == 'equi':
+                # feat: [B, C, 3, N]
+                inv_feat = self.vn_invariant_layer(feat) # [B, C*3, N]
+                scores = self.attention_mlp(inv_feat.permute(0, 2, 1)) # [B, N, 1]
+                weights = F.softmax(scores, dim=1) 
+                
+                # Weighted Sum (Broadcasting)
+                weights = weights.permute(0, 2, 1).unsqueeze(1) # (B, 1, 1, N)
+                global_feat = torch.sum(feat * weights, dim=-1) # (B, C, 3)
+                
+            elif self.mode == 'normal':
+                # feat: [B, C, N]
+                scores = self.attention_mlp(feat.permute(0, 2, 1)) # [B, N, 1]
+                weights = F.softmax(scores, dim=1) # (B, N, 1)
+                
+                weights = weights.permute(0, 2, 1) # (B, 1, N)
+                global_feat = torch.sum(feat * weights, dim=-1) # (B, C)
+            return global_feat
+            
+        elif self.pooling == 'mean':
+            return torch.mean(feat, dim=-1)
+        elif self.pooling == 'max':
+             if self.mode == 'equi': return self.vn_pool(feat)
+             else: return torch.max(feat, dim=-1)[0]
 
     def forward_head(self, g_feat):
         if self.mode == 'equi':
@@ -255,7 +251,7 @@ class PointNet_VN_Gravity_Bayes_v2(nn.Module):
         return mu, kappa
 
     def forward(self, p, q):
-        # 1. Backbone
+        # 1. Backbone (includes Sign-Invariant input for normal mode)
         f_p, n_p = self.extract_feat(p) 
         f_q, n_q = self.extract_feat(q)
         
@@ -263,7 +259,7 @@ class PointNet_VN_Gravity_Bayes_v2(nn.Module):
         self.q_normals = n_q
         
         # 2. Downsampling
-        stride = 16 
+        stride = self.stride 
         if self.mode == 'equi':
             f_p_small = f_p[:, :, :, ::stride]
             f_q_small = f_q[:, :, :, ::stride]
@@ -271,20 +267,12 @@ class PointNet_VN_Gravity_Bayes_v2(nn.Module):
             f_p_small = f_p[:, :, ::stride]
             f_q_small = f_q[:, :, ::stride]
         
-        # 3. Interaction (Self -> Cross)
+        # 3. Interaction
         f_p_gated, f_q_gated = self.process_interaction(f_p_small, f_q_small)
         
         # 4. Pooling
-        if self.pooling == 'mean':
-            g_p = torch.mean(f_p_gated, dim=-1)
-            g_q = torch.mean(f_q_gated, dim=-1)
-        else:
-            if self.mode == 'equi':
-                g_p = self.vn_pool(f_p_gated)
-                g_q = self.vn_pool(f_q_gated)
-            else:
-                g_p = torch.max(f_p_gated, dim=-1)[0]
-                g_q = torch.max(f_q_gated, dim=-1)[0]
+        g_p = self.apply_pooling(f_p_gated)
+        g_q = self.apply_pooling(f_q_gated)
             
         # 5. Head
         mu_p, kappa_p = self.forward_head(g_p)
@@ -297,15 +285,12 @@ class PointNet_VN_Gravity_Bayes_v2(nn.Module):
         Analytic Covariance Hypothesis Testing with Robustness Floor
         """
         if self.p_normals is None or self.q_normals is None:
-            # Fallback
             return np.ones(len(P_indices), dtype=bool), np.zeros(len(P_indices))
 
         # 1. Retrieve Stored Normals
-        # Transpose to (N, 3)
         curr_p_normals = self.p_normals[batch_idx].transpose(0, 1) 
         curr_q_normals = self.q_normals[batch_idx].transpose(0, 1) 
         
-        # 2. Select Correspondences (Indices handling)
         dev = curr_p_normals.device
         if not isinstance(P_indices, torch.Tensor): P_indices = torch.tensor(P_indices, device=dev)
         if not isinstance(Q_indices, torch.Tensor): Q_indices = torch.tensor(Q_indices, device=dev)
@@ -313,38 +298,30 @@ class PointNet_VN_Gravity_Bayes_v2(nn.Module):
         n_p = curr_p_normals[P_indices] 
         n_q = curr_q_normals[Q_indices] 
         
-        # 3. Inclination & Geometric Sensitivity
-        # Ensure g_p, g_q are normalized
+        # 2. Inclination & Geometric Sensitivity
         I_p = torch.matmul(n_p, g_p)
         I_q = torch.matmul(n_q, g_q)
         
-        # sin^2 term (Geometric Sensitivity)
+        # sin^2 term (Geometric Sensitivity) using Absolute Inclination for Sign Robustness
+        # Note: sin^2(x) = 1 - cos^2(x). Effect is same for +I or -I.
         sin2_p = torch.clamp(1.0 - I_p**2, min=1e-6)
         sin2_q = torch.clamp(1.0 - I_q**2, min=1e-6)
         
-        # 4. Geometric Covariance (Analytic)
-        dot_normals = (n_p * n_q).sum(dim=1)
-        cov_numerator = dot_normals - (I_p * I_q)
-        
-        # [CRITICAL FIX] Additive Noise Model (Robustness Floor)
-        # base_variance represents sensor noise + ICP misalignment tolerance.
-        # 0.01 corresponds to allowing roughly ~0.1 difference in inclination (like DNN)
-        # when kappa is extremely high.
+        # 3. Geometric Covariance & Variance
+        # Additive Noise Floor (Critical for BNN robustness)
         base_variance = 0.01 
         
         term_p = sin2_p / (kappa_p + 1e-6)
         term_q = sin2_q / (kappa_q + 1e-6)
-        term_cov = 2.0 * cov_numerator / (torch.sqrt(kappa_p * kappa_q) + 1e-6)
         
-        # Pure Analytic Variance
-        sigma_sq_analytic = term_p + term_q - term_cov
+        # Simplified joint variance (assuming independence for robustness against sign flips)
+        sigma_sq_total = term_p + term_q + base_variance
         
-        # Final Variance = Analytic + Base Floor
-        # This prevents division by zero-ish values when kappa is huge.
-        sigma_sq_total = torch.clamp(sigma_sq_analytic, min=1e-8) + base_variance
+        # 4. Test Statistic (Absolute Difference)
+        # [KEY FIX] Compare Absolute Values to ignore Sign Ambiguity of Raw Normals
+        diff = torch.abs(I_p) - torch.abs(I_q)
+        residual_sq = diff**2
         
-        # 5. Test
-        residual_sq = (I_p - I_q)**2
         M2_score = residual_sq / sigma_sq_total
         
         valid_mask = M2_score < chi2_thresh

@@ -3,3 +3,4 @@ _target_: utils.model.PointNet_VN_Gravity_Bayes_v2
 pooling: max
 normal_channel: false
 mode: 'normal'
+stride: 8
