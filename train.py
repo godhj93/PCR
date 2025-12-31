@@ -6,11 +6,10 @@ from omegaconf import DictConfig, OmegaConf
 from termcolor import colored
 from hydra.core.hydra_config import HydraConfig
 import torch.nn as nn
-# PyTorch, TensorBoard 예시를 위해 import
 import torch
 from torch.utils.tensorboard import SummaryWriter
 from utils.data import data_loader
-from utils.common import train_one_epoch, AverageMeter, count_parameters
+from utils.common import train_one_epoch, AverageMeter, count_parameters, logging_tensorboard
 from termcolor import colored
 
 log = logging.getLogger(__name__)
@@ -37,8 +36,6 @@ def train(cfg: DictConfig) -> None:
     train_loader, test_loader = data_loader(cfg)
     model = hydra.utils.instantiate(cfg.model).to(cfg.device)
     log.info(f"Model Parameters: {count_parameters(model):,}")
-    
-    # optimizer = torch.optim.SGD(model.parameters(), lr=cfg.optimizer.lr)
     optimizer = hydra.utils.instantiate(cfg.optim, params=model.parameters())
     loss_fn = hydra.utils.instantiate(cfg.loss)
     
@@ -61,12 +58,8 @@ def train(cfg: DictConfig) -> None:
                         metric = {'train': AvgMeter_train, 'val': AvgMeter_val},
                         cfg = cfg)
         
-        train_loss = result['train_loss']
-        val_loss = result['val_loss']
+        train_loss, val_loss = logging_tensorboard(writer, result, epoch, optimizer)
         
-        writer.add_scalar("Loss/train", train_loss, epoch)
-        writer.add_scalar("Loss/test", val_loss, epoch)
-        writer.add_scalar("Learning_Rate", optimizer.param_groups[0]['lr'], epoch)
         log.info(colored(f"Epoch [{epoch}/{cfg.training.epochs}] - Train Loss: {train_loss:.4f}, Test Loss: {val_loss:.4f}", "cyan"))
 
         # save checkpoint
@@ -78,7 +71,7 @@ def train(cfg: DictConfig) -> None:
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': best_loss,
             }, checkpoint_dir / "ckpt.pt")
-            log.info(f"Saved Best Model with Test Loss: {best_loss:.4f} at Epoch {epoch}")
+            log.info(colored(f"Saved Best Model with Test Loss: {best_loss:.4f} at Epoch {epoch}", "green"))
         
     writer.close()
     log.info("===== Training End =====")

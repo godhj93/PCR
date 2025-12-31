@@ -89,23 +89,27 @@ def train_one_epoch(model, data_loader, optimizer, loss_fn, epoch, metric, cfg):
     
     model.train() 
     pbar = tqdm(data_loader['train'], ncols=0)
-    
     AvgMeter_train = metric['train']
     
     for batch in pbar:
         
         # Data Load
-        p = batch['p'].to(cfg.device)         # (B, 3, N)
-        q = batch['q'].to(cfg.device)         # (B, 3, N)
-        
-        gravity_p = batch['gravity_p'].to(cfg.device) # (B, 3)
-        gravity_q = batch['gravity_q'].to(cfg.device) # (B, 3)
+        p_t = batch['P_t'].to(cfg.device)         # (B, 3, N)
+        q = batch['q'].to(cfg.device)           # (B, 3, N)
+        t = batch['t'].to(cfg.device)           # (B, 1)
+        v_target = batch['v_target'].to(cfg.device) # (B, 6)
+        g_p = batch['g_p_t'].to(cfg.device) # (B, 3)
+        g_q = batch['g_q'].to(cfg.device) # (B, 3
         
         # Forward Pass
-        (mu_p, kappa_p), (mu_q, kappa_q) = model(p, q)
-        loss_p = loss_fn(mu_p, kappa_p, gravity_p)
-        loss_q = loss_fn(mu_q, kappa_q, gravity_q)
-        loss = (loss_p + loss_q) / 2.0
+        v_pred, (mu_p, kappa_p), (mu_q, kappa_q) = model(p_t, t, q)
+        
+        loss, log_dict = loss_fn(
+            v_pred = v_pred,
+            v_target = v_target,
+            variational_params = {'mu_p': mu_p, 'kappa_p': kappa_p, 'mu_q': mu_q, 'kappa_q': kappa_q},
+            gt_physics = {'g_p': g_p, 'g_q': g_q}
+        )
         
         optimizer.zero_grad()
         loss.backward()
@@ -116,9 +120,9 @@ def train_one_epoch(model, data_loader, optimizer, loss_fn, epoch, metric, cfg):
         pbar.set_description(f"Epoch [{epoch} / {cfg.training.epochs}] Train Loss: {AvgMeter_train.avg:.4f}, kappa: {(kappa_p.mean() + kappa_q.mean()).item() / 2:.4f}")
         
     # Validation
-    val_loss = test_one_epoch(model, data_loader['test'], loss_fn, metric, cfg, epoch)
+    val_loss, val_log_dict = test_one_epoch(model, data_loader['test'], loss_fn, metric, cfg, epoch)
     
-    return {'train_loss': AvgMeter_train.avg, 'val_loss': val_loss}
+    return {'train_loss': AvgMeter_train.avg, 'train_loss_dict': log_dict, 'val_loss': val_loss, 'val_loss_dict': val_log_dict}
     
 def test_one_epoch(model, test_loader, loss_fn, metric, cfg, epoch=0, visualize=False):
     
@@ -127,7 +131,6 @@ def test_one_epoch(model, test_loader, loss_fn, metric, cfg, epoch=0, visualize=
     
     pbar = tqdm(test_loader, ncols=0)
     
-    # visualize=True일 때 결과를 저장할 리스트
     if visualize:
         results = {
             'p': [], 'q': [],
@@ -140,42 +143,74 @@ def test_one_epoch(model, test_loader, loss_fn, metric, cfg, epoch=0, visualize=
         for batch in pbar:
             
             # Data Load
-            p = batch['p'].to(cfg.device)         # (B, 3, N)
+            p_t = batch['P_t'].to(cfg.device)         # (B, 3, N)
             q = batch['q'].to(cfg.device)         # (B, 3, N)
-            
-            gravity_p = batch['gravity_p'].to(cfg.device) # (B, 3)
-            gravity_q = batch['gravity_q'].to(cfg.device) # (B, 3)
+            t = batch['t'].to(cfg.device)         # (B, 1)
+            v_target = batch['v_target'].to(cfg.device) # (B, 6)
+            g_p = batch['g_p_t'].to(cfg.device) # (B, 3)
+            g_q = batch['g_q'].to(cfg.device) # (B, 3)
             
             # Forward Pass
-            (mu_p, kappa_p), (mu_q, kappa_q) = model(p, q)
+            v_pred, (mu_p, kappa_p), (mu_q, kappa_q) = model(p_t, t,q)
             
-            loss_p = loss_fn(mu_p, kappa_p, gravity_p)
-            loss_q = loss_fn(mu_q, kappa_q, gravity_q)
-            loss = (loss_p + loss_q) / 2.0
+            loss, log_dict = loss_fn(
+                v_pred = v_pred,
+                v_target = v_target,
+                variational_params = {'mu_p': mu_p, 'kappa_p': kappa_p, 'mu_q': mu_q, 'kappa_q': kappa_q},
+                gt_physics = {'g_p': g_p, 'g_q': g_q}
+            )
             
             AvgMeter_val.update(loss.item(), q.size(0))
             
             pbar.set_description(f"Epoch [{epoch} / {cfg.training.epochs}] Val Loss: {AvgMeter_val.avg:.4f}, kappa: {(kappa_p.mean() + kappa_q.mean()).item() / 2:.4f}")
             
-            # visualize=True일 때 결과 저장
             if visualize:
-                results['p'].append(p.cpu())
+                results['p'].append(p_t.cpu())
                 results['q'].append(q.cpu())
-                results['gravity_p'].append(gravity_p.cpu())
-                results['gravity_q'].append(gravity_q.cpu())
+                results['gravity_p'].append(g_p.cpu())
+                results['gravity_q'].append(g_q.cpu())
                 results['mu_p'].append(mu_p.cpu())
                 results['kappa_p'].append(kappa_p.cpu())
                 results['mu_q'].append(mu_q.cpu())
                 results['kappa_q'].append(kappa_q.cpu())
     
     if visualize:
-        # 모든 배치를 하나로 합치기
         for key in results:
             results[key] = torch.cat(results[key], dim=0)
         return AvgMeter_val.avg, results
     
-    return AvgMeter_val.avg 
+    return AvgMeter_val.avg, log_dict
 
+def logging_tensorboard(writer, result, epoch, optimizer):
+    
+    train_loss = result['train_loss']
+    train_loss_v_pred = result['train_loss_dict']['loss_action']
+    train_loss_g_pred = result['train_loss_dict']['loss_perception']
+    train_loss_g_p_pred = result['train_loss_dict']['loss_g_p']
+    train_loss_g_q_pred = result['train_loss_dict']['loss_g_q']
+    
+    val_loss = result['val_loss']
+    val_loss_v_pred = result['val_loss_dict']['loss_action']
+    val_loss_g_pred = result['val_loss_dict']['loss_perception']
+    val_loss_g_p_pred = result['val_loss_dict']['loss_g_p']
+    val_loss_g_q_pred = result['val_loss_dict']['loss_g_q']
+    
+    writer.add_scalar("Loss/train/total", train_loss, epoch)
+    writer.add_scalar("Loss/train/v_pred", train_loss_v_pred, epoch)
+    writer.add_scalar("Loss/train/g_pred", train_loss_g_pred, epoch)
+    writer.add_scalar("Loss/train/g_p_pred", train_loss_g_p_pred, epoch)
+    writer.add_scalar("Loss/train/g_q_pred", train_loss_g_q_pred, epoch)
+    
+    writer.add_scalar("Loss/val/total", val_loss, epoch)
+    writer.add_scalar("Loss/val/v_pred", val_loss_v_pred, epoch)
+    writer.add_scalar("Loss/val/g_pred", val_loss_g_pred, epoch)
+    writer.add_scalar("Loss/val/g_p_pred", val_loss_g_p_pred, epoch)
+    writer.add_scalar("Loss/val/g_q_pred", val_loss_g_q_pred, epoch)
+    
+    writer.add_scalar("Learning_Rate", optimizer.param_groups[0]['lr'], epoch)
+    
+    return train_loss, val_loss
+    
 def visualize_registration(P, Q, R, t, vis, title="Registration Result"):
     """
     P: (3, N) source point cloud

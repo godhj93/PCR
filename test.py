@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import argparse
 import os
 import sys
+import math
 from omegaconf import OmegaConf
 from scipy.spatial import cKDTree as KDTree
 from iterative_closet_point.bunny import run_icp, calculatenormal
@@ -61,13 +62,26 @@ class GeometryUtils:
         ir = np.mean(dists < ir_thresh) * 100.0
         return rre, rte, cd, ir
 
+    # ! New Implementation: Lie Algebra Utilities from provided code
+    @staticmethod
+    def skew(v):
+        x, y, z = v.ravel()
+        return np.array([[0, -z, y], [z, 0, -x], [-y, x, 0]], dtype=np.float64)
+
+    @staticmethod
+    def exp_so3(omega):
+        theta = np.linalg.norm(omega)
+        if theta < 1e-12: return np.eye(3)
+        K = GeometryUtils.skew(omega / theta)
+        return np.eye(3) + math.sin(theta)*K + (1 - math.cos(theta))*(K @ K)
+
 # ==================================================================================
 # 2. Multi-Strategy ICP Solvers
 # ==================================================================================
 class ICPSolvers:
     def __init__(self, P, Q, g_p_gt, g_q_gt, 
                  neural_model=None, neural_preds=None, batch_idx=None,
-                 max_iter=60, tol=1e-6):
+                 max_iter=60, tol=1e-6, chi2_thresh=9.0, method='p2p'):
         self.P_raw = P
         self.Q_raw = Q
         self.g_p_gt = g_p_gt / (np.linalg.norm(g_p_gt) + 1e-8)
@@ -79,16 +93,83 @@ class ICPSolvers:
         
         self.max_iter = max_iter
         self.tol = tol
+        self.method = method # 'p2p', 'p2l', 'l2l'
         
+        # ! New Implementation: Normals are needed for both P and Q depending on method
         self.norm_P = calculatenormal(P, k=20)
         self.norm_Q = calculatenormal(Q, k=20)
+        
         self.centroid_P = np.mean(P, axis=0)
         self.centroid_Q = np.mean(Q, axis=0)
         self.tree_Q = KDTree(self.Q_raw)
 
+        self.chi2 = chi2_thresh
+        
     def _get_resolution(self, pcd):
         tree = KDTree(pcd); d, _ = tree.query(pcd[:100], k=2)
         return np.mean(d[:, 1])
+
+    # ! New Implementation: Integrated Gauss-Newton Solver Step (Replacing SVD)
+    # This logic matches the provided 'run_icp' structure but allows Neural Gating injection.
+    def _step_gauss_newton(self, Pt, Qt, nP, nQ, R_curr):
+        A = np.zeros((6,6)); b = np.zeros((6,1))
+        N = Pt.shape[0]
+        I3 = np.eye(3)
+
+        # 1. Assemble Linear System (A * delta = b)
+        if self.method == 'p2p':
+            for i in range(N):
+                x = Pt[i] - Qt[i]
+                J = np.zeros((3,6))
+                J[:, :3] = I3
+                J[:, 3:] = -GeometryUtils.skew(Pt[i])
+                A += J.T @ J
+                b += J.T @ x.reshape(3,1)
+                
+        elif self.method == 'p2l':
+            # Needs Target Normals (nQ)
+            for i in range(N):
+                n = nQ[i].reshape(1,3)
+                e = float(n @ (Pt[i] - Qt[i]).reshape(3,1))
+                J = np.zeros((1,6))
+                J[0,:3] = n
+                J[0,3:] = -n @ GeometryUtils.skew(Pt[i])
+                A += J.T @ J
+                b += J.T * e
+                
+        elif self.method == 'l2l':
+            # Needs Source (nP) and Target (nQ) Normals
+            # nP must be rotated by current R to match frame
+            # But here we assume nP is already rotated outside or we handle it here.
+            # The provided code assumes R handles rotation. 
+            # In our loop, Pt is already rotated. So nP should be rotated too.
+            for i in range(N):
+                nq = nQ[i].reshape(3,1)
+                np_curr = nP[i].reshape(3,1) 
+                
+                Tq = I3 - nq @ nq.T
+                Tp = I3 - np_curr @ np_curr.T
+                # Mi approx = Tq + Tp (since R is handled by input points)
+                Mi = Tq + Tp 
+                
+                ri = (Pt[i] - Qt[i]).reshape(3,1)
+                J = np.zeros((3,6))
+                J[:, :3] = I3
+                J[:, 3:] = -GeometryUtils.skew(Pt[i])
+                A += J.T @ Mi @ J
+                b += J.T @ Mi @ ri
+
+        # 2. Solve for Delta
+        try:
+            delta = -np.linalg.solve(A, b)
+        except np.linalg.LinAlgError:
+            delta = -np.linalg.lstsq(A, b, rcond=None)[0]
+            
+        dt = delta[:3].reshape(3,1)
+        dw = delta[3:].ravel()
+        dR = GeometryUtils.exp_so3(dw)
+        
+        return dR, dt.flatten()
 
     # -------------------------------------------------------------------------
     # A. Baseline Methods (Standard & GT Gravity)
@@ -96,7 +177,8 @@ class ICPSolvers:
     def run_standard_icp(self):
         P_init = self.P_raw + (self.centroid_Q - self.centroid_P)
         resolution = self._get_resolution(P_init)
-        R, t, _ = run_icp(P_init, self.Q_raw, "p2p", self.norm_P, self.norm_Q, self.max_iter, self.tol, 10.0*resolution, np.eye(3), np.zeros((3,1)), False)
+        # ! New Implementation: Pass self.method to external run_icp
+        R, t, _ = run_icp(P_init, self.Q_raw, self.method, self.norm_P, self.norm_Q, self.max_iter, self.tol, 10.0*resolution, np.eye(3), np.zeros((3,1)), False)
         t_center = self.centroid_Q - self.centroid_P
         P_final = (R @ P_init.T).T + t.flatten()
         t_total = (R @ t_center.reshape(3, 1)).flatten() + t.flatten()
@@ -109,7 +191,8 @@ class ICPSolvers:
         P_init = P_aligned + t_center
         norm_P_aligned = (R_grav @ self.norm_P.T).T
         resolution = self._get_resolution(P_init)
-        R_ref, t_ref, _ = run_icp(P_init, self.Q_raw, "p2p", norm_P_aligned, self.norm_Q, self.max_iter, self.tol, 10.0*resolution, np.eye(3), np.zeros((3,1)), False)
+        # ! New Implementation: Pass self.method
+        R_ref, t_ref, _ = run_icp(P_init, self.Q_raw, self.method, norm_P_aligned, self.norm_Q, self.max_iter, self.tol, 10.0*resolution, np.eye(3), np.zeros((3,1)), False)
         R_total = R_ref @ R_grav
         t_total = (R_ref @ t_center.reshape(3,1)).flatten() + t_ref.flatten()
         P_final = (R_total @ self.P_raw.T).T + t_total
@@ -137,13 +220,15 @@ class ICPSolvers:
         resolution = self._get_resolution(P_best_init)
         norm_P_best = (R_best_yaw @ (R_grav @ self.norm_P.T).T.T).T
 
-        R_ref, t_ref, _ = run_icp(P_best_init, self.Q_raw, "p2p", norm_P_best, self.norm_Q, self.max_iter, self.tol, 10.0*resolution, np.eye(3), np.zeros((3,1)), False)
+        # ! New Implementation: Pass self.method
+        R_ref, t_ref, _ = run_icp(P_best_init, self.Q_raw, self.method, norm_P_best, self.norm_Q, self.max_iter, self.tol, 10.0*resolution, np.eye(3), np.zeros((3,1)), False)
         R_total = R_ref @ R_best_yaw @ R_grav
         P_final = (R_ref @ P_best_init.T).T + t_ref.flatten()
         t_total = np.mean(P_final, 0) - (R_total @ np.mean(self.P_raw, 0))
         return P_final, R_total, t_total
 
     def _run_constrained_solver(self, use_inclination=False, use_height=False):
+        # ! New Implementation: Updated to use Gauss-Newton Step
         R_grav = GeometryUtils.get_gravity_rotation(self.g_p_gt, self.g_q_gt)
         P_curr = (R_grav @ self.P_raw.T).T
         t_center = self.centroid_Q - np.mean(P_curr, axis=0)
@@ -168,18 +253,20 @@ class ICPSolvers:
                 median_h_diff = np.median(h_diff[valid]) if np.sum(valid) > 0 else 0
                 valid &= (np.abs(h_diff - median_h_diff) < 0.3)
 
-            if np.sum(valid) < 10: break
+            if np.sum(valid) < 6: break
+            
             src_match = P_curr[valid]; tgt_match = self.Q_raw[indices][valid]
-            mu_s = np.mean(src_match, 0); mu_t = np.mean(tgt_match, 0)
-            W = (src_match - mu_s).T @ (tgt_match - mu_t)
-            U, _, Vt = np.linalg.svd(W)
-            R_step = Vt.T @ U.T
-            if np.linalg.det(R_step) < 0: Vt[2,:] *= -1; R_step = Vt.T @ U.T
-            t_step = mu_t - R_step @ mu_s
-            P_curr = (R_step @ P_curr.T).T + t_step
-            norm_P_curr = (R_step @ norm_P_curr.T).T
-            R_accum = R_step @ R_accum
-            t_accum = (R_step @ t_accum.reshape(3,1)).flatten() + t_step
+            nP_match = norm_P_curr[valid]; nQ_match = self.norm_Q[indices][valid]
+            
+            # Optimization Step
+            dR, dt = self._step_gauss_newton(src_match, tgt_match, nP_match, nQ_match, R_accum)
+            
+            # Update
+            P_curr = (P_curr @ dR.T) + dt
+            norm_P_curr = (norm_P_curr @ dR.T) # Rotate Normals
+            
+            R_accum = dR @ R_accum
+            t_accum = (dR @ t_accum.reshape(3,1)).flatten() + dt
 
         R_total = R_accum @ R_grav
         t_total = (R_accum @ t_center.reshape(3,1)).flatten() + t_accum
@@ -190,7 +277,7 @@ class ICPSolvers:
     def run_fused_icp(self): return self._run_constrained_solver(use_inclination=True, use_height=True)
 
     # -------------------------------------------------------------------------
-    # B. Neural Methods (Renamed: BNN vs DNN)
+    # B. Neural Methods (BNN vs DNN)
     # -------------------------------------------------------------------------
     def run_neural_constrained_icp(self):
         """ BNN: Uses Predicted Gravity + Kappa-based Hypothesis Testing """
@@ -202,6 +289,7 @@ class ICPSolvers:
         P_curr = (R_grav @ self.P_raw.T).T
         t_center = self.centroid_Q - np.mean(P_curr, axis=0)
         P_curr += t_center
+        norm_P_curr = (R_grav @ self.norm_P.T).T # ! New Implementation: Track normals
         
         R_accum = np.eye(3); t_accum = np.zeros(3)
         resolution = self._get_resolution(P_curr)
@@ -217,20 +305,24 @@ class ICPSolvers:
                 batch_idx=self.batch_idx, P_indices=P_indices, Q_indices=indices,
                 g_p=self.neural_preds['mu_p'], kappa_p=self.neural_preds['kappa_p'],
                 g_q=self.neural_preds['mu_q'], kappa_q=self.neural_preds['kappa_q'],
-                chi2_thresh=args.chi2
+                chi2_thresh= self.chi2
             )
             valid = valid_geom & is_inlier_neural
             
-            if np.sum(valid) < 10: break
+            if np.sum(valid) < 6: break
+            
             src_match = P_curr[valid]; tgt_match = self.Q_raw[indices][valid]
-            mu_s = np.mean(src_match, 0); mu_t = np.mean(tgt_match, 0)
-            W = (src_match - mu_s).T @ (tgt_match - mu_t)
-            U, _, Vt = np.linalg.svd(W); R_step = Vt.T @ U.T
-            if np.linalg.det(R_step) < 0: Vt[2,:] *= -1; R_step = Vt.T @ U.T
-            t_step = mu_t - R_step @ mu_s
-            P_curr = (R_step @ P_curr.T).T + t_step
-            R_accum = R_step @ R_accum
-            t_accum = (R_step @ t_accum.reshape(3,1)).flatten() + t_step
+            nP_match = norm_P_curr[valid]; nQ_match = self.norm_Q[indices][valid]
+            
+            # ! New Implementation: Optimization Step using Gauss-Newton
+            dR, dt = self._step_gauss_newton(src_match, tgt_match, nP_match, nQ_match, R_accum)
+            
+            # Update
+            P_curr = (P_curr @ dR.T) + dt
+            norm_P_curr = (norm_P_curr @ dR.T) # Rotate Normals
+            
+            R_accum = dR @ R_accum
+            t_accum = (dR @ t_accum.reshape(3,1)).flatten() + dt
 
         R_total = R_accum @ R_grav
         t_total = (R_accum @ t_center.reshape(3,1)).flatten() + t_accum
@@ -259,21 +351,24 @@ class ICPSolvers:
             dists, indices = self.tree_Q.query(P_curr, k=1)
             valid = dists < dist_thresh
             
-            # [KEY] Fixed Threshold (0.2) - Simulates Deterministic DNN
+            # [KEY] Fixed Threshold (0.2)
             inc_P = np.dot(norm_P_curr, g_q_pred)
             valid &= (np.abs(inc_P - inc_Q[indices]) < 0.2) 
             
-            if np.sum(valid) < 10: break
+            if np.sum(valid) < 6: break
+            
             src_match = P_curr[valid]; tgt_match = self.Q_raw[indices][valid]
-            mu_s = np.mean(src_match, 0); mu_t = np.mean(tgt_match, 0)
-            W = (src_match - mu_s).T @ (tgt_match - mu_t)
-            U, _, Vt = np.linalg.svd(W); R_step = Vt.T @ U.T
-            if np.linalg.det(R_step) < 0: Vt[2,:] *= -1; R_step = Vt.T @ U.T
-            t_step = mu_t - R_step @ mu_s
-            P_curr = (R_step @ P_curr.T).T + t_step
-            norm_P_curr = (R_step @ norm_P_curr.T).T
-            R_accum = R_step @ R_accum
-            t_accum = (R_step @ t_accum.reshape(3,1)).flatten() + t_step
+            nP_match = norm_P_curr[valid]; nQ_match = self.norm_Q[indices][valid]
+            
+            # ! New Implementation: Optimization Step using Gauss-Newton
+            dR, dt = self._step_gauss_newton(src_match, tgt_match, nP_match, nQ_match, R_accum)
+            
+            # Update
+            P_curr = (P_curr @ dR.T) + dt
+            norm_P_curr = (norm_P_curr @ dR.T)
+            
+            R_accum = dR @ R_accum
+            t_accum = (dR @ t_accum.reshape(3,1)).flatten() + dt
 
         R_total = R_accum @ R_grav
         t_total = (R_accum @ t_center.reshape(3,1)).flatten() + t_accum
@@ -308,7 +403,7 @@ def draw_result(ax, P, Q, g_p, g_q, title, metrics_str=None, color_title='black'
     ax.set_title(f"{title}\n{metrics_str}" if metrics_str else title, fontsize=10, color=color_title, fontweight='bold')
     set_axes_equal_union(ax, all_pts)
 
-def visualize_samples(ckpt_path, model, loader, num_samples=50):
+def visualize_samples(ckpt_path, model, chi2, method, loader, num_samples=50):
     print(f"Processing samples: Robustness Comparison (Target: {num_samples})...")
     save_dir = os.path.join(ckpt_path, "results_comprehensive")
     os.makedirs(save_dir, exist_ok=True)
@@ -316,16 +411,16 @@ def visualize_samples(ckpt_path, model, loader, num_samples=50):
     model.eval()
     device = next(model.parameters()).device
     
-    # [UPDATED] List of ALL Algorithms (Reordered for Logical Flow)
-    # DNN (No-K) comes before BNN (Ours)
     algo_names = [
         "Standard", "Gravity(GT)", "YawSearch", "Inc(GT)", "Fused(GT)", 
-        "DNN", "BNN"
+        "DNN", "BNN", "BNN(Iter)"
     ]
     stats = {name: [] for name in algo_names}
     total_processed = 0
     
-    # Table Formatting
+    THRESH_RRE = 5.0
+    THRESH_RTE = 0.2
+    
     CW_ID, CW_AL = 6, 13
     print("\n" + "="*(CW_ID + len(algo_names)*CW_AL + 20))
     header = f"{'Sample':<{CW_ID}} | " + " | ".join([f"{name[:12]:<{CW_AL}}" for name in algo_names])
@@ -339,8 +434,10 @@ def visualize_samples(ckpt_path, model, loader, num_samples=50):
             p_tensor = batch['p'].to(device)
             q_tensor = batch['q'].to(device)
             
-            # Forward Pass
             (mu_p_b, k_p_b), (mu_q_b, k_q_b) = model(p_tensor, q_tensor)
+            
+            batch_p_normals_backup = model.p_normals
+            batch_q_normals_backup = model.q_normals
             
             src_batch = batch['p'].numpy().transpose(0, 2, 1) 
             tgt_batch = batch['q'].numpy().transpose(0, 2, 1)
@@ -353,56 +450,95 @@ def visualize_samples(ckpt_path, model, loader, num_samples=50):
             for i in range(batch_size):
                 if total_processed >= num_samples: break
                 
+                model.p_normals = batch_p_normals_backup
+                model.q_normals = batch_q_normals_backup
+                
                 P_raw = src_batch[i]; Q = tgt_batch[i]
                 g_p_gt = grav_p_gt_batch[i]; g_q_gt = grav_q_gt_batch[i]
-                neural_preds = {'mu_p': mu_p_b[i], 'kappa_p': k_p_b[i], 'mu_q': mu_q_b[i], 'kappa_q': k_q_b[i]}
                 
-                solver = ICPSolvers(P_raw, Q, g_p_gt, g_q_gt, neural_model=model, neural_preds=neural_preds, batch_idx=i)
+                neural_preds_init = {
+                    'mu_p': mu_p_b[i], 'kappa_p': k_p_b[i], 
+                    'mu_q': mu_q_b[i], 'kappa_q': k_q_b[i]
+                }
+                
+                # ! New Implementation: Pass method
+                solver = ICPSolvers(P_raw, Q, g_p_gt, g_q_gt, 
+                                    neural_model=model, neural_preds=neural_preds_init, 
+                                    batch_idx=i, chi2_thresh=chi2, method=method)
+                
                 ir_thresh = 3.0 * solver._get_resolution(P_raw)
                 P_gt = (R_gt_batch[i] @ P_raw.T).T + t_gt_batch[i]
                 
                 current_metrics = []
                 results = {}
 
-                # Loop through all algorithms
                 for algo in algo_names:
+                    P_res, R_res, t_res = None, None, None
+
                     if algo == "Standard": P_res, R_res, t_res = solver.run_standard_icp()
                     elif algo == "Gravity(GT)": P_res, R_res, t_res = solver.run_gravity_icp()
                     elif algo == "YawSearch": P_res, R_res, t_res = solver.run_gravity_yaw_search_icp()
                     elif algo == "Inc(GT)": P_res, R_res, t_res = solver.run_gravity_inclination_icp()
                     elif algo == "Fused(GT)": P_res, R_res, t_res = solver.run_fused_icp()
-                    elif algo == "DNN": P_res, R_res, t_res = solver.run_neural_no_kappa_icp() # Was Neural(No-K)
-                    elif algo == "BNN": P_res, R_res, t_res = solver.run_neural_constrained_icp() # Was Neural
+                    elif algo == "DNN": P_res, R_res, t_res = solver.run_neural_no_kappa_icp() 
+                    elif algo == "BNN": P_res, R_res, t_res = solver.run_neural_constrained_icp() 
                     
+                    elif algo == "BNN(Iter)":
+                        P_curr = P_raw.copy()
+                        R_accum = np.eye(3)
+                        t_accum = np.zeros(3)
+                        max_outer_iter = 5 
+                        for iter_idx in range(max_outer_iter):
+                            p_tensor_curr = torch.from_numpy(P_curr).float().to(device).transpose(0, 1).unsqueeze(0)
+                            (mu_p_curr, k_p_curr), _ = model(p_tensor_curr, q_tensor[i].unsqueeze(0))
+                            curr_preds = {
+                                'mu_p': mu_p_curr[0], 'kappa_p': k_p_curr[0],
+                                'mu_q': mu_q_b[i],    'kappa_q': k_q_b[i] 
+                            }
+                            solver_step = ICPSolvers(P_curr, Q, g_p_gt, g_q_gt, 
+                                                     neural_model=model, neural_preds=curr_preds, 
+                                                     batch_idx=0, chi2_thresh=chi2, method=method)
+                            P_next, dR, dt = solver_step.run_neural_constrained_icp()
+                            trace = np.trace(dR)
+                            trace = np.clip((trace - 1) / 2, -1.0, 1.0)
+                            angle_diff = np.degrees(np.arccos(trace))
+                            dist_diff = np.linalg.norm(dt)
+                            R_accum = dR @ R_accum
+                            t_accum = (dR @ t_accum.reshape(3,1)).flatten() + dt
+                            P_curr = P_next
+                            if angle_diff < 0.1 and dist_diff < 1e-4: break
+                        P_res, R_res, t_res = P_curr, R_accum, t_accum
+
                     m = GeometryUtils.compute_full_metrics(P_res, P_gt, Q, R_res, R_gt_batch[i], t_res, t_gt_batch[i], ir_thresh)
                     stats[algo].append(m)
                     results[algo] = P_res
                     current_metrics.append(m)
                 
-                # Log Row
-                log_strs = [f"{m[0]:5.1f}/{m[1]:<4.2f}" for m in current_metrics]
-                row_str = f"{total_processed:<{CW_ID}} | " + " | ".join([f"{s:<{CW_AL}}" for s in log_strs])
+                log_strs = []
+                for m in current_metrics:
+                    rre, rte = m[0], m[1]
+                    val_str = f"{rre:5.1f}/{rte:<4.2f}"
+                    padded_str = f"{val_str:<{CW_AL}}"
+                    if rre < THRESH_RRE and rte < THRESH_RTE:
+                        log_strs.append(colored(padded_str, 'green'))
+                    else:
+                        log_strs.append(colored(padded_str, 'red'))
+                
+                row_str = f"{total_processed:<{CW_ID}} | " + " | ".join(log_strs)
                 print(row_str)
                 
-                # Visualization (2x4 Grid)
-                fig = plt.figure(figsize=(20, 10))
-                
-                # Plot 1: Input
-                ax1 = fig.add_subplot(2, 4, 1, projection='3d')
+                fig = plt.figure(figsize=(20, 20))
+                ax1 = fig.add_subplot(3, 3, 1, projection='3d')
                 draw_result(ax1, P_raw + (solver.centroid_Q - solver.centroid_P), Q, g_p_gt, g_q_gt, "Input (Std Init)", ir_thresh=ir_thresh)
-
                 for idx, algo in enumerate(algo_names):
-                    ax = fig.add_subplot(2, 4, idx+2, projection='3d')
-                    g_vis = neural_preds['mu_p'].detach().cpu().numpy() if algo in ["DNN", "BNN"] else g_p_gt
+                    ax = fig.add_subplot(3, 3, idx+2, projection='3d')
+                    g_vis = neural_preds_init['mu_p'].detach().cpu().numpy() if "Neural" in algo or "BNN" in algo or "DNN" in algo else g_p_gt
                     draw_result(ax, results[algo], Q, g_vis, g_q_gt, algo, f"RRE:{stats[algo][-1][0]:.1f}", ir_thresh=ir_thresh)
-                
                 plt.tight_layout()
                 plt.savefig(os.path.join(save_dir, f"sample_{total_processed}.png"))
                 plt.close()
-
                 total_processed += 1
                 
-    THRESH_RRE = 5.0; THRESH_RTE = 0.1
     print("\n" + "="*140)
     print(f" FINAL SUMMARY (Over {total_processed} samples)")
     print("="*140)
@@ -416,31 +552,35 @@ def visualize_samples(ckpt_path, model, loader, num_samples=50):
         print(f"{name:<15} | {success_rate:<10.1f} | {arr[:,0].mean():<10.4f} | {arr[:,1].mean():<10.4f} | {arr[:,2].mean():<10.4f}")
     print("="*140)
 
-def main(ckpt):
+def main(ckpt, chi2, method, overrides=None):
     yaml_path = os.path.join(os.path.dirname(ckpt), '.hydra', 'config.yaml')
     if os.path.exists(yaml_path):
         cfg = OmegaConf.load(yaml_path)
+        if overrides:
+            print(colored(f"[Info] Applying overrides: {overrides}", "yellow"))
+            override_cfg = OmegaConf.from_dotlist(overrides)
+            cfg = OmegaConf.merge(cfg, override_cfg)
         try:
             model = hydra.utils.instantiate(cfg.model).to(cfg.device)
         except Exception as e:
             print(colored(f"[Error] Model instantiation failed: {e}", "red"))
             return
-
         weight_path = os.path.join(ckpt, "weights/ckpt.pt")
-        if os.path.exists(weight_path):
+        if os.path.exists(weight_path):            
             checkpoint = torch.load(weight_path, map_location=cfg.device)
             model.load_state_dict(checkpoint['model_state_dict'], strict=False)
             print(colored(f"Loaded Neural Model Weights from {weight_path}", "green"))
     else:
         print("[Error] Config not found.")
         return
-        
+    print(cfg)
     _, test_loader = data_loader(cfg)
-    visualize_samples(os.path.dirname(ckpt), model, test_loader, num_samples=100)
+    visualize_samples(os.path.dirname(ckpt), model, chi2, method, test_loader, num_samples=100)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", type=str, required=True, help="Path to checkpoint directory or file")
     parser.add_argument("--chi2", type=float, default=9.0, help="Chi-squared threshold for BNN correspondence validity")
-    args = parser.parse_args()
-    main(args.ckpt)
+    parser.add_argument("--method", type=str, default='p2p', help="ICP method to use: ['p2p', 'p2l', 'l2l']")
+    args, unknown_args = parser.parse_known_args()
+    main(args.ckpt, args.chi2, args.method, overrides=unknown_args)

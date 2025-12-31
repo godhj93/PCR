@@ -1,6 +1,6 @@
 defaults:
   - _self_
-  - model: pointnet_v2
+  - model: flow_model
   - optim: sgd
   - override hydra/job_logging: default
   - override hydra/hydra_logging: default
@@ -36,6 +36,11 @@ data:
   num_workers: 8
   partial_overlap: True
   keep_ratio: 0.8
-  
+  path_generator:
+    _target_: utils.path.SE3GeodesicProbPath
+    manifold: 
+      _target_: utils.se3.SE3
+
 loss:
-  _target_: utils.loss.VMFLoss
+  _target_: utils.loss.ELBOObjective
+  beta: 1.0

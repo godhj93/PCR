@@ -17,6 +17,7 @@ from pathlib import Path
 import open3d as o3d
 from utils.common import visualize_registration
 import matplotlib.pyplot as plt
+import hydra
 
 def load_modelnet40_data(partition: str = 'train') -> Tuple[np.ndarray, np.ndarray]:
     """Load ModelNet40 data from h5 files."""
@@ -88,7 +89,8 @@ class RegistrationDataset(Dataset):
                  unseen: bool = False, 
                  factor: float = 1,
                  partial_overlap: bool = True,
-                 keep_ratio: float = 0.1):
+                 keep_ratio: float = 0.1,
+                 path_generator = None):
         
         self.dataset_name = dataset_name.lower()
         self.num_points = num_points
@@ -98,6 +100,7 @@ class RegistrationDataset(Dataset):
         self.factor = factor
         self.partial_overlap = partial_overlap 
         self.keep_ratio = keep_ratio    
+        self.path_generator = path_generator
         
         # ! Gravity 설정 (World frame에서의 중력 방향)
         # ! 여기서는 z-축 음의 방향을 "중력"으로 정의 (예: g_world = (0, 0, -1))
@@ -304,26 +307,92 @@ class RegistrationDataset(Dataset):
             P0 = jitter_pointcloud(P0)
             Q0 = jitter_pointcloud(Q0)
 
-        return {
-            'p': P0.T.astype('float32'),          
-            'p_raw': P_raw.astype('float32'),  
-            'q': Q0.T.astype('float32'),          
+        # ---------------------------------------------------------------------
+        # ! New: Flow Matching Path Generation
+        # ---------------------------------------------------------------------
+        P_t_out = None
+        v_target_out = None
+        t_out = None
+        g_p_t_out = None
+
+    
+        # 1. Prepare T_gt (Relative Pose from P0 to Q0)
+        # P0 -> Q0 : Q0 = R_ab * P0 + t_ab
+        # T_gt = [[R_ab, t_ab], [0, 1]]
+        T_gt = torch.eye(4)
+        T_gt[:3, :3] = torch.from_numpy(R_ab)
+        T_gt[:3, 3] = torch.from_numpy(translation_ab)
+        
+        # 2. Sample random time t
+        # 배치 처리를 위해 (1,) 형태로 생성
+        t_scalar = torch.rand(1)
+        
+        # 3. Path Sampling (CPU)
+        x_0 = torch.eye(4).unsqueeze(0) # Identity (P0 기준)
+        x_1 = T_gt.unsqueeze(0)         # Target (Q0 기준)
+        t_tensor = t_scalar
+        
+        # Generator 실행 (Gradient 불필요)
+        with torch.no_grad():
+            path_sample = self.path_generator.sample(x_0, x_1, t_tensor)
             
+        # 결과 추출 (Tensor)
+        T_t_mat = path_sample.x_t.squeeze(0)   # (4, 4) Current Pose
+        v_target = path_sample.dx_t.squeeze(0) # (6,) Target Velocity
+        
+        # 4. Apply T_t to P0 (Generate P_t)
+        # P_t = R_t * P0 + t_t
+        # 주의: P0는 numpy (N, 3) -> Tensor 변환 필요
+        P0_tensor = torch.from_numpy(P0).float() # (N, 3)
+        
+        R_t = T_t_mat[:3, :3]
+        t_t = T_t_mat[:3, 3]
+        
+        # (N, 3) @ (3, 3)^T + (3,) => (N, 3)
+        P_t = torch.matmul(P0_tensor, R_t.T) + t_t
+        
+        # 5. Compute Gravity at time t (for Perception Loss)
+        # g_p(t) = R_t * g_p(0)
+        # g_p는 현재 numpy (3,) -> Tensor 변환
+        g_p_tensor = torch.from_numpy(g_p).float()
+        g_p_t = torch.matmul(R_t, g_p_tensor)
+        
+        # Output 저장 (Tensor 상태로 반환)
+        P_t_out = P_t
+        v_target_out = v_target
+        t_out = t_scalar
+        g_p_t_out = g_p_t
+        
+        # Return Dictionary 구성
+        # P0, Q0 등 기존 데이터도 필요하면 Tensor로 변환하거나 그대로 둠
+        # PyTorch DataLoader는 numpy array를 자동으로 Tensor로 collate 해줌
+        
+        return_dict = {
+            'p': P0.astype('float32'),          
+            'q': Q0.astype('float32'),          
+            
+            # Existing Metadatas
             'R_src': R_src.astype('float32'),       
             'R_pq': R_ab.astype('float32'),         
             't_pq': translation_ab.astype('float32'),
+            'corr_idx': corr,
             
-            'R_qp': R_ba.astype('float32'),
-            't_qp': translation_ba.astype('float32'),
-            
-            'euler_pq': euler_ab.astype('float32'),
-            'euler_qp': -euler_ab[::-1].astype('float32'),
-            
-            'corr_idx': corr, # Partial Overlap일 경우 의미 없는 값(0)일 수 있음 주의
-            
-            'gravity_p': g_p,   
-            'gravity_q': g_q,   
+            # ! New: Gravity Info (기존 g_p는 t=0 시점, g_p_t는 t 시점)
+            'g_p_init': g_p,  
+            'g_q': g_q,   
         }
+        
+        # ! New: Flow Matching Data 추가
+        if P_t_out is not None:
+            return_dict.update({
+                'P_t': P_t_out,         # (N, 3) Tensor
+                't': t_out,             # (1,) Tensor
+                'v_target': v_target_out, # (6,) Tensor
+                'g_p_t': g_p_t_out,     # (3,) Tensor (Current Gravity)
+            })
+
+        return return_dict
+    
         
     def __len__(self):
         if self.dataset_name == 'modelnet40':
@@ -361,7 +430,8 @@ def data_loader(cfg):
             gaussian_noise=cfg.data.gaussian_noise,
             unseen=cfg.data.unseen,
             factor=cfg.data.factor,
-            keep_ratio=cfg.data.keep_ratio
+            keep_ratio=cfg.data.keep_ratio,
+            path_generator=hydra.utils.instantiate(cfg.data.path_generator)
         )
         test_dataset = RegistrationDataset(
             dataset_name=dataset_name,
@@ -371,7 +441,8 @@ def data_loader(cfg):
             gaussian_noise=False,
             unseen=cfg.data.unseen,
             factor=cfg.data.factor,
-            keep_ratio=cfg.data.keep_ratio
+            keep_ratio=cfg.data.keep_ratio,
+            path_generator=hydra.utils.instantiate(cfg.data.path_generator)
         )
         
     elif dataset_name == 'bunny':
@@ -390,7 +461,8 @@ def data_loader(cfg):
             gaussian_noise=cfg.data.gaussian_noise,
             unseen=cfg.data.unseen,
             factor=cfg.data.factor,
-            keep_ratio=cfg.data.keep_ratio
+            keep_ratio=cfg.data.keep_ratio,
+            path_generator=hydra.utils.instantiate(cfg.data.path_generator)
         )
         test_dataset = RegistrationDataset(
             dataset_name=dataset_name,
@@ -400,7 +472,8 @@ def data_loader(cfg):
             gaussian_noise=False,
             unseen=cfg.data.unseen,
             factor=cfg.data.factor,
-            keep_ratio=cfg.data.keep_ratio
+            keep_ratio=cfg.data.keep_ratio,
+            path_generator=hydra.utils.instantiate(cfg.data.path_generator)
         )
     else:
         raise ValueError(f"Unsupported dataset: {dataset_name}. 'modelnet40' 또는 'bunny'여야 합니다.")

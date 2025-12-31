@@ -1,65 +1,29 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from utils.pointnet_vn import PointNetEncoder
-from utils.dgcnn_vn import VN_DGCNN_Encoder
 from utils.layers import VNLinearLeakyReLU, VNLinear, VNInvariant, VN_Attention, VN_Cross_Gating, VNMaxPool, NormalEstimator
 import numpy as np
 
-class PointNet_VN_Gravity(nn.Module):
-    def __init__(self, pooling, normal_channel=True):
-        super(PointNet_VN_Gravity, self).__init__()
-        self.pooling = pooling
-        channel = 6 if normal_channel else 3
-        
-        # PointNetEncoder는 보통 1024//3 = 341 채널을 반환한다고 가정
-        self.feat = PointNetEncoder(self.pooling, global_feat=True, feature_transform=True, channel=channel)
-        
-        # (B, 341, 3) -> (B, 512, 3)
-        self.vn_fc1 = VNLinearLeakyReLU(1024//3, 512, dim=3)
-        self.vn_fc2 = VNLinearLeakyReLU(512, 128, dim=3)
-        self.vn_fc3 = VNLinear(128, 1) 
-
-    def forward(self, x):
-        x = self.feat(x)
-        x = self.vn_fc1(x)
-        x = self.vn_fc2(x)
-        x = self.vn_fc3(x)
-        g_pred = x.view(-1, 3)
-        g_pred = F.normalize(g_pred, p=2, dim=1)
-        return g_pred
-
-class PointNet_VN_Gravity_Bayes(PointNet_VN_Gravity):
-    def __init__(self, pooling, normal_channel=True):
-        super(PointNet_VN_Gravity_Bayes, self).__init__(pooling, normal_channel)
-        
-        self.vn_invariant = VNInvariant(128)
-        self.kappa_mlp = nn.Sequential(
-            nn.Linear(128, 64),
-            nn.LeakyReLU(0.2),
-            nn.Linear(64, 1),
-            nn.Softplus()
-        )
-
-    def forward(self, x):
-        x = self.feat(x)
-        x = self.vn_fc1(x)
-        x = self.vn_fc2(x)
-        
-        # Mu Branch
-        mu = self.vn_fc3(x)
-        mu = mu.view(-1, 3)
-        mu = F.normalize(mu, p=2, dim=1)
-        
-        # Kappa Branch
-        x_inv = self.vn_invariant(x)
-        kappa = self.kappa_mlp(x_inv)
-        kappa = kappa + 1.0
-        
-        return mu, kappa
+class TimeEmbedding(nn.Module):
+    """
+    Scalar 시간 t를 고차원 벡터로 변환하여 모델이 시간 흐름에 민감하게 반응하도록 함.
+    Gaussian Fourier Projection 방식 사용.
+    """
+    def __init__(self, embed_dim, scale=30.):
+        super().__init__()
+        # 학습되지 않는 고정된 랜덤 주파수 (Fixed Random Frequencies)
+        self.W = nn.Parameter(torch.randn(embed_dim // 2) * scale, requires_grad=False)
+    
+    def forward(self, t):
+        # t: [B] -> [B, 1]
+        t = t.view(-1, 1) if t.dim() == 1 else t
+        # t_proj: [B, embed_dim/2]
+        t_proj = t * self.W[None, :] * 2 * np.pi
+        # output: [B, embed_dim]
+        return torch.cat([torch.sin(t_proj), torch.cos(t_proj)], dim=-1)
     
 class PointNet_VN_Gravity_Bayes_v2(nn.Module):
-    def __init__(self, pooling='attentive', normal_channel=False, mode='equi', stride=16):
+    def __init__(self, pooling='attentive', mode='equi', stride=16):
         """
         Args:
             pooling: 'mean', 'max', or 'attentive' 
@@ -131,7 +95,7 @@ class PointNet_VN_Gravity_Bayes_v2(nn.Module):
             self.std_self_attn = nn.MultiheadAttention(embed_dim=self.feat_dim, num_heads=4, batch_first=True)
             self.std_cross_attn = nn.MultiheadAttention(embed_dim=self.feat_dim, num_heads=4, batch_first=True)
             
-            # [NEW] Attentive Pooling Components
+            # Attentive Pooling Components
             if self.pooling == 'attentive':
                 self.attention_mlp = nn.Sequential(
                     nn.Linear(self.feat_dim, 128),
@@ -250,7 +214,7 @@ class PointNet_VN_Gravity_Bayes_v2(nn.Module):
             kappa = self.kappa_mlp(g_feat) + 1.0
         return mu, kappa
 
-    def forward(self, p, q):
+    def forward(self, p, q, return_feat=False):
         # 1. Backbone (includes Sign-Invariant input for normal mode)
         f_p, n_p = self.extract_feat(p) 
         f_q, n_q = self.extract_feat(q)
@@ -278,6 +242,8 @@ class PointNet_VN_Gravity_Bayes_v2(nn.Module):
         mu_p, kappa_p = self.forward_head(g_p)
         mu_q, kappa_q = self.forward_head(g_q)
         
+        if return_feat:
+            return g_p, g_q, mu_p, mu_q, kappa_p, kappa_q
         return (mu_p, kappa_p), (mu_q, kappa_q)
         
     def check_correspondence_validity(self, batch_idx, P_indices, Q_indices, g_p, kappa_p, g_q, kappa_q, chi2_thresh=9.0):
@@ -328,107 +294,195 @@ class PointNet_VN_Gravity_Bayes_v2(nn.Module):
         
         return valid_mask.cpu().numpy(), M2_score.cpu().numpy()
     
-class DGCNN_VN_Gravity(nn.Module):
-    def __init__(self, k=20, normal_channel=False):
-        super(DGCNN_VN_Gravity, self).__init__()
+class PhysicsAttention(nn.Module):
+    def __init__(self, dim, num_heads=4):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, batch_first=True)
+        self.norm = nn.LayerNorm(dim)
         
-        # 1. VN DGCNN Encoder
-        self.feat = VN_DGCNN_Encoder(k=k, embed_dim=1024)
+    def forward(self, query, key_value):
+        # query: [B, 1, D] (Physics)
+        # key_value: [B, 2, D] (Geometry [P, Q])
         
-        # [수정] 에러 로그에 따르면 Encoder 출력은 1024 채널입니다.
-        # (30x1024 input error implies last dim is 1024)
-        encoder_dim = 1024 
-        
-        # 2. Regression Head
-        self.vn_fc1 = VNLinearLeakyReLU(encoder_dim, 512, dim=3)
-        self.vn_fc2 = VNLinearLeakyReLU(512, 128, dim=3)
-        self.vn_fc3 = VNLinear(128, 1) 
+        # Q가 K, V를 참조하여 필요한 정보를 추출
+        attn_out, _ = self.attn(query, key_value, key_value)
+        return self.norm(query + attn_out) # Residual Connection
 
-    def forward(self, x):
-        # Input Handling (XYZ only)
-        if x.size(1) > 3:
-            x = x[:, :3, :]
+class GravityVelocityDecoder(nn.Module):
+    def __init__(self, feat_dim, time_embed_dim=64, hidden_dim=512, encoder_mode='equi'):
+        super().__init__()
+        self.encoder_mode = encoder_mode
+        self.hidden_dim = hidden_dim
+        
+        # 1. Time Embedding
+        self.time_embed = TimeEmbedding(time_embed_dim)
+        
+        # 2. Feature Adapter (Geometry Projection)
+        if self.encoder_mode == 'equi':
+            input_feat_dim = feat_dim * 3
+        else:
+            input_feat_dim = feat_dim
             
-        x = self.feat(x)       # (B, 1024, 3)
-        x = self.vn_fc1(x)     # (B, 512, 3)
-        x = self.vn_fc2(x)     # (B, 128, 3)
-        x = self.vn_fc3(x)     # (B, 1, 3)
+        self.geom_proj = nn.Sequential(
+            nn.Linear(input_feat_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU()
+        )
         
-        g_pred = x.view(-1, 3)
-        g_pred = F.normalize(g_pred, p=2, dim=1)
+        # 3. Physics Adapter (Query Generation)
+        # Physics Input: Mu(3*2) + Kappa(1*2) + Time(time_dim)
+        physics_dim = (3 * 2) + (1 * 2) + time_embed_dim
+        self.physics_proj = nn.Sequential(
+            nn.Linear(physics_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU()
+        )
         
-        return g_pred
-
-class DGCNN_VN_Gravity_Bayes(DGCNN_VN_Gravity):
-    def __init__(self, k=20, normal_channel=False):
-        super(DGCNN_VN_Gravity_Bayes, self).__init__(k, normal_channel)
+        # 4. Cross Attention (Fusion)
+        # Physics(Query) -> Geometry(Key/Value)
+        self.cross_attn = PhysicsAttention(hidden_dim, num_heads=8)
         
-        self.vn_invariant = VNInvariant(128) 
-        self.kappa_mlp = nn.Sequential(
-            nn.Linear(128, 64),
-            nn.LeakyReLU(0.2),
-            nn.Linear(64, 1),
-            nn.Softplus()
+        # 5. Velocity Head
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim), # Attention 결과(hidden_dim)만 받음
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 6) # se(3) velocity
         )
 
-    def forward(self, x):
-        if x.size(1) > 3:
-            x = x[:, :3, :]
+    def forward(self, g_p, g_q, mu_p, mu_q, kappa_p, kappa_q, t):
+        B = g_p.shape[0]
+        
+        # --- [Step 1] Prepare Geometry (Key/Value) ---
+        flat_p = g_p.reshape(B, -1)
+        flat_q = g_q.reshape(B, -1)
+        
+        h_p = self.geom_proj(flat_p) # [B, D]
+        h_q = self.geom_proj(flat_q) # [B, D]
+        
+        # Stack Geometry context: [B, 2, D]
+        geom_kv = torch.stack([h_p, h_q], dim=1)
+        
+        # --- [Step 2] Prepare Physics (Query) ---
+        t_emb = self.time_embed(t)
+        
+        # Concatenate Physics inputs
+        phys_raw = torch.cat([mu_p, mu_q, kappa_p, kappa_q, t_emb], dim=1) # [B, physics_dim]
+        phys_q = self.physics_proj(phys_raw).unsqueeze(1) # [B, 1, D]
+        
+        # --- [Step 3] Cross Attention Fusion ---
+        # "물리적 상황(Query)에 맞춰 기하학적 정보(KV)를 긁어오기"
+        fused_feat = self.cross_attn(query=phys_q, key_value=geom_kv) # [B, 1, D]
+        fused_feat = fused_feat.squeeze(1) # [B, D]
+        
+        # --- [Step 4] Predict ---
+        v_pred = self.head(fused_feat)
+        
+        return v_pred
 
-        # Backbone
-        x = self.feat(x)
-        x = self.vn_fc1(x)
-        x = self.vn_fc2(x)
+class GravityFlowAgent(nn.Module):
+    def __init__(self, pooling='attentive', mode='normal', stride=4):
+        super().__init__()
+        self.encoder = PointNet_VN_Gravity_Bayes_v2(pooling = pooling, mode=mode, stride=stride)
+        self.decoder = GravityVelocityDecoder(
+            feat_dim=self.encoder.feat_dim,
+            encoder_mode=self.encoder.mode
+        )
+
+    def forward(self, x, t, context_q):
+        # Transpose 처리
+        # if x.shape[1] != 3 and x.shape[2] == 3: x = x.transpose(1, 2)
+        # if context_q.shape[1] != 3 and context_q.shape[2] == 3: context_q = context_q.transpose(1, 2)
+
+        # 1. 상태 인지 (Perception)
+        feat_p, feat_q, mu_p, mu_q, kappa_p, kappa_q = self.encoder(x, context_q, return_feat=True)
         
-        # Mu Branch
-        mu = self.vn_fc3(x)
-        mu = mu.view(-1, 3)
-        mu = F.normalize(mu, p=2, dim=1)
+        # 2. 행동 결정 (Action)
+        v_pred = self.decoder(
+            g_p=feat_p, g_q=feat_q,
+            mu_p=mu_p, mu_q=mu_q,
+            kappa_p=kappa_p, kappa_q=kappa_q,
+            t=t
+        )
         
-        # Kappa Branch
-        x_inv = self.vn_invariant(x)
-        kappa = self.kappa_mlp(x_inv)
-        kappa = kappa + 1.0
-        
-        return mu, kappa
+        return v_pred, (mu_p, kappa_p), (mu_q, kappa_q)
     
 if __name__ == '__main__':
+    print("=== Model & Loss Test Start ===\n")
+
+    # 1. Encoder 및 Agent 인스턴스 생성
+    # (PointNet_VN_Gravity_Bayes_v2, GravityVelocityDecoder는 이미 정의되어 있다고 가정)
+    encoder = PointNet_VN_Gravity_Bayes_v2(mode='normal', pooling='attentive', stride=4)
+    agent = GravityFlowAgent(encoder)
     
-    # 1. Setup Data
-    B, C, N = 10, 3, 30 
-    points = torch.randn(B, C, N)
-    print("Input Points Shape:", points.shape)
+    from utils.loss import VMFLoss
+    # Loss 함수 인스턴스
+    vmf_loss_fn = VMFLoss()
     
-    # 2. Rotate
-    theta = np.pi / 4
-    rotation_matrix = torch.tensor([
-        [np.cos(theta), -np.sin(theta), 0],
-        [np.sin(theta),  np.cos(theta), 0],
-        [0,              0,             1]
-    ], dtype=torch.float32)
+    # 파라미터 개수 확인
+    total_params = sum(p.numel() for p in agent.parameters() if p.requires_grad)
+    print(f"Total Trainable Parameters: {total_params:,}")
+
+    # 2. Dummy Inputs 생성
+    B, N = 4, 1024
+    P_t = torch.randn(B, 3, N) # 변형된 Source Point Cloud
+    Q = torch.randn(B, 3, N)   # Target Point Cloud
+    t = torch.rand(B)          # Random Time [0, 1]
     
-    rotated_points = torch.matmul(rotation_matrix, points) 
-    print("Rotated Points Shape:", rotated_points.shape)
+    # 3. Dummy Targets (Ground Truth) 생성
+    # Flow Matching 정답 속도 (Linear 3 + Angular 3)
+    u_gt = torch.randn(B, 6)
     
-    # 3. Model Init
-    print("Initializing Model...")
-    model = DGCNN_VN_Gravity_Bayes(k=20, normal_channel=False)
-    model.eval()
+    # Gravity 정답 벡터 (단위 벡터여야 함)
+    g_gt_p = F.normalize(torch.randn(B, 3), p=2, dim=1) # P_t 시점의 정답 중력
+    g_gt_q = F.normalize(torch.randn(B, 3), p=2, dim=1) # Q 시점의 정답 중력
+
+    # 4. Forward Pass
+    print("\n[Step 1] Forward Pass...")
+    # 수정된 Agent는 3가지 튜플을 반환함
+    v_pred, (mu_p, kappa_p), (mu_q, kappa_q) = agent(P_t, t, Q)
     
-    # 4. Inference & Validation
-    with torch.no_grad():
-        # [수정] 모델이 Tuple (mu, kappa)를 반환하므로 unpacking 필요
-        mu1, kappa1 = model(points)
-        mu2, kappa2 = model(rotated_points)
+    print(f"  - Velocity Shape : {v_pred.shape}")   # [4, 6]
+    print(f"  - Mu P Shape     : {mu_p.shape}")     # [4, 3]
+    print(f"  - Kappa P Shape  : {kappa_p.shape}")  # [4, 1]
     
-    # [수정] Equivariance 체크는 방향 벡터(mu)에 대해서만 수행
-    # mu1을 회전시킨 것과 mu2가 같아야 함
-    mu1_rotated = mu1 @ rotation_matrix.T 
+    # 5. Loss Calculation
+    print("\n[Step 2] Computing Losses...")
     
-    loss = F.mse_loss(mu2, mu1_rotated)
-    print(f"Equivariance Loss (Mu): {loss.item():.6f}")
+    # (A) Flow Loss (MSE)
+    loss_flow = F.mse_loss(v_pred, u_gt)
+    print(f"  - Flow Loss      : {loss_flow.item():.4f}")
     
-    # Kappa는 Invariant 해야 함 (회전해도 불확실성은 같아야 함)
-    kappa_loss = F.mse_loss(kappa1, kappa2)
-    print(f"Invariance Loss (Kappa): {kappa_loss.item():.6f}")
-    print("Output Shape (Mu):", mu1.shape)
+    # (B) Gravity Loss (VMFLoss for P and Q)
+    loss_g_p = vmf_loss_fn(mu_p, kappa_p, g_gt_p)
+    loss_g_q = vmf_loss_fn(mu_q, kappa_q, g_gt_q)
+    loss_gravity = (loss_g_p + loss_g_q) * 0.5
+    print(f"  - Gravity Loss P : {loss_g_p.item():.4f}")
+    print(f"  - Gravity Loss Q : {loss_g_q.item():.4f}")
+    
+    # (C) Total Loss
+    beta = 1.0
+    total_loss = loss_flow + beta * loss_gravity
+    print(f"  - Total Loss     : {total_loss.item():.4f}")
+
+    # 6. Backward Pass (Gradient Check)
+    print("\n[Step 3] Backward Pass...")
+    
+    # Backward 실행
+    try:
+        total_loss.backward()
+        print("  - Backward execution successful!")
+        
+        # [수정] net[0] 대신 head[0] 또는 geom_proj[0]의 gradient를 확인
+        # agent.decoder.head[0]은 Velocity Head의 첫 번째 Linear Layer입니다.
+        grad_norm = agent.decoder.head[0].weight.grad.norm()
+        
+        print(f"  - Gradient Norm at Decoder Head Layer 0: {grad_norm.item():.4f}")
+        
+        if grad_norm > 0:
+            print("  => SUCCESS: Gradients are flowing correctly.")
+        else:
+            print("  => WARNING: Gradient is zero.")
+            
+    except RuntimeError as e:
+        print(f"  => FAILURE: Backward pass failed with error: {e}")

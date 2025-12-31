@@ -1,0 +1,5 @@
+# @package model
+_target_: utils.model.GravityFlowAgent
+pooling: attentive
+mode: 'normal'
+stride: 4
