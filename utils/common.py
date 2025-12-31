@@ -123,7 +123,7 @@ def train_one_epoch(model, data_loader, optimizer, loss_fn, epoch, metric, cfg):
         
     # Validation
     if epoch % 10 == 0 or epoch == cfg.training.epochs - 1:
-        integrate = False
+        integrate = True
     else:
         integrate = False
         

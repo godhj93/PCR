@@ -327,15 +327,7 @@ class RegistrationDataset(Dataset):
         g_p_tensor = torch.from_numpy(g_p).float()
         g_p_t = torch.matmul(R_t, g_p_tensor)
         g_p_t = g_p_t / (torch.norm(g_p_t) + 1e-8) # Normalization
-
-        # ---------------------------------------------------------------------
-        # 5. [핵심 수정] Transpose & Memory Optimization
-        # (N, 3) -> (3, N) 변환을 수행하되, np.ascontiguousarray를 사용하여
-        # 메모리 구조를 정리합니다. 이렇게 하면 DataLoader 속도가 빨라지고
-        # 모델이 좌표(XYZ)를 헷갈리지 않아 Kappa가 정상적으로 증가합니다.
-        # ---------------------------------------------------------------------
         
-        # 1) Numpy Data (P0, Q0)
         p_out = np.ascontiguousarray(P0.T).astype('float32')
         q_out = np.ascontiguousarray(Q0.T).astype('float32')
         

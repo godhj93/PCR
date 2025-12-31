@@ -119,6 +119,7 @@ class PointNet_VN_Gravity_Bayes_v2(nn.Module):
         Extract features. 
         For 'normal' mode, converts normals to sign-invariant outer product features (9 channels).
         """
+            
         B, D, N = x.shape
         
         # 1. Normal Estimation
