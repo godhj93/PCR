@@ -259,7 +259,7 @@ class RegistrationDataset(Dataset):
         
         if self.partition != 'train':
             np.random.seed(item)
-        dist = 10.0
+        dist = 0.0
         translation_ab = np.array([
             np.random.uniform(-dist, dist),
             np.random.uniform(-dist, dist),

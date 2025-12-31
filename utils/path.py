@@ -46,10 +46,16 @@ class SE3GeodesicProbPath(ProbPath):
         # 1. Time Scheduling
         if self.scheduler is not None:
             t_expanded = expand_tensor_like(t, x_1[..., 0:1])
-            time_val = self.scheduler(t_expanded).alpha_t.squeeze(-1)
+            # ! Edit: Retrieve d_alpha_t for correct velocity scaling
+            sched_out = self.scheduler(t_expanded)
+            time_val = sched_out.alpha_t.squeeze(-1)
+            d_alpha_t = sched_out.d_alpha_t.squeeze(-1)
         else:
             time_val = t
+            d_alpha_t = torch.ones_like(t) # ! Edit: Linear case derivative is 1
+        
         t_view = time_val.view(-1, 1, 1)
+        d_alpha_view = d_alpha_t.view(-1, 1) # ! Edit: View for broadcasting
 
         # 2. Compute Relative Transform
         # T_rel = x_0^{-1} @ x_1
@@ -66,7 +72,8 @@ class SE3GeodesicProbPath(ProbPath):
         
         # 4. Extract 6D Target Velocity (Vector)
         # [Key Update] 4x4 행렬을 6차원 벡터로 변환하여 반환
-        dx_t_vec = self._mat2vec_se3(u_static_mat) # (B, 6)
+        # ! Edit: Apply time derivative scale (d_alpha_t) to target velocity
+        dx_t_vec = self._mat2vec_se3(u_static_mat) * d_alpha_view # (B, 6)
 
         # 5. Compute Intermediate Pose x_t
         # Integrate: x_t = x_0 * exp(t * u)
