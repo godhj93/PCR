@@ -3,6 +3,8 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D 
 import numpy as np
+from utils.se3 import SE3
+from utils.inference import RiemannianEulerSolver, SE3VectorField
 
 def AverageMeter():
     """Computes and stores the average and current value"""
@@ -120,38 +122,57 @@ def train_one_epoch(model, data_loader, optimizer, loss_fn, epoch, metric, cfg):
         pbar.set_description(f"Epoch [{epoch} / {cfg.training.epochs}] Train Loss: {AvgMeter_train.avg:.4f}, kappa: {(kappa_p.mean() + kappa_q.mean()).item() / 2:.4f}")
         
     # Validation
-    val_loss, val_log_dict = test_one_epoch(model, data_loader['test'], loss_fn, metric, cfg, epoch)
+    if epoch % 10 == 0 or epoch == cfg.training.epochs - 1:
+        integrate = False
+    else:
+        integrate = False
+        
+    val_loss, val_log_dict = test_one_epoch(model, data_loader['test'], loss_fn, metric, cfg, epoch, visualize=False, integrate=integrate)
     
     return {'train_loss': AvgMeter_train.avg, 'train_loss_dict': log_dict, 'val_loss': val_loss, 'val_loss_dict': val_log_dict}
     
-def test_one_epoch(model, test_loader, loss_fn, metric, cfg, epoch=0, visualize=False):
+def test_one_epoch(model, test_loader, loss_fn, metric, cfg, epoch=0, visualize=False, integrate=True):
     
     model.eval()
     AvgMeter_val = metric['val']
     
+    # Integration을 위한 매니폴드 객체 (한 번만 생성)
+    se3_manifold = SE3().to(cfg.device)
+    
+    # 에러 통계를 내기 위한 리스트
+    rot_errors_list = []
+    trans_errors_list = []
+    
     pbar = tqdm(test_loader, ncols=0)
     
+    # Visualization 결과 저장소
     if visualize:
         results = {
             'p': [], 'q': [],
             'gravity_p': [], 'gravity_q': [],
             'mu_p': [], 'kappa_p': [],
-            'mu_q': [], 'kappa_q': []
+            'mu_q': [], 'kappa_q': [],
+            'T_pred': [] # 적분된 포즈도 저장
         }
     
+    # 마지막 배치의 log_dict를 저장하기 위한 변수 (초기화)
+    last_log_dict = {}
+
     with torch.no_grad():
         for batch in pbar:
             
-            # Data Load
-            p_t = batch['P_t'].to(cfg.device)         # (B, 3, N)
+            # -----------------------------------------------------------
+            # 1. Data Load & Loss Calculation
+            # -----------------------------------------------------------
+            p_t = batch['P_t'].to(cfg.device)     # (B, 3, N) - Loss 계산용 (중간 경로)
             q = batch['q'].to(cfg.device)         # (B, 3, N)
             t = batch['t'].to(cfg.device)         # (B, 1)
-            v_target = batch['v_target'].to(cfg.device) # (B, 6)
-            g_p = batch['g_p_t'].to(cfg.device) # (B, 3)
-            g_q = batch['g_q'].to(cfg.device) # (B, 3)
+            v_target = batch['v_target'].to(cfg.device) 
+            g_p = batch['g_p_t'].to(cfg.device) 
+            g_q = batch['g_q'].to(cfg.device) 
             
             # Forward Pass
-            v_pred, (mu_p, kappa_p), (mu_q, kappa_q) = model(p_t, t,q)
+            v_pred, (mu_p, kappa_p), (mu_q, kappa_q) = model(p_t, t, q)
             
             loss, log_dict = loss_fn(
                 v_pred = v_pred,
@@ -160,27 +181,127 @@ def test_one_epoch(model, test_loader, loss_fn, metric, cfg, epoch=0, visualize=
                 gt_physics = {'g_p': g_p, 'g_q': g_q}
             )
             
+            # Update Average Loss
             AvgMeter_val.update(loss.item(), q.size(0))
+            last_log_dict = log_dict # 나중에 반환할 기본 log 정보 업데이트
             
-            pbar.set_description(f"Epoch [{epoch} / {cfg.training.epochs}] Val Loss: {AvgMeter_val.avg:.4f}, kappa: {(kappa_p.mean() + kappa_q.mean()).item() / 2:.4f}")
+            # -----------------------------------------------------------
+            # 2. Integration Logic (Optional)
+            # -----------------------------------------------------------
+            current_r_err = 0.0
+            current_t_err = 0.0
             
+            if integrate:
+                # A. 초기 데이터 (t=0) 가져오기
+                P_init = batch['p'].to(cfg.device) # (B, 3, N) - Augmentation된 초기 소스
+                if P_init.shape[1] != 3: P_init = P_init.transpose(1, 2)
+                
+                # B. GT Pose 구성
+                R_gt = batch['R_pq'].to(cfg.device)
+                t_gt = batch['t_pq'].to(cfg.device)
+                T_gt = torch.eye(4, device=cfg.device).repeat(P_init.shape[0], 1, 1)
+                T_gt[:, :3, :3] = R_gt
+                T_gt[:, :3, 3] = t_gt
+                
+                # C. Solver 설정 (Vector Field)
+                vf = SE3VectorField(model, P_init, q)
+                
+                # Euler Solver (Step size 0.1 -> 10 Steps)
+                solver = RiemannianEulerSolver(
+                    vector_field=vf,
+                    manifold=se3_manifold,
+                    step_size=0.1 
+                )
+                
+                # D. 적분 수행 (Identity -> T_pred)
+                T_init = torch.eye(4, device=cfg.device).repeat(P_init.shape[0], 1, 1)
+                T_pred = solver.sample(T_init, t0=0.0, t1=1.0)
+                
+                # E. 에러 계산 및 저장
+                r_err, t_err = compute_errors(T_pred, T_gt)
+                rot_errors_list.append(r_err)
+                trans_errors_list.append(t_err)
+                
+                current_r_err = r_err.mean().item()
+                current_t_err = t_err.mean().item()
+
+                if visualize:
+                    results['T_pred'].append(T_pred.cpu())
+            
+            # -----------------------------------------------------------
+            # Logging (Pbar Description)
+            # -----------------------------------------------------------
+            desc = f"Ep [{epoch}] Val Loss: {AvgMeter_val.avg:.4f}"
+            if integrate:
+                desc += f" | R: {current_r_err:.2f}°, T: {current_t_err:.4f}"
+            pbar.set_description(desc)
+            
+            # Visualization Data Collection
             if visualize:
-                results['p'].append(p_t.cpu())
-                results['q'].append(q.cpu())
-                results['gravity_p'].append(g_p.cpu())
-                results['gravity_q'].append(g_q.cpu())
-                results['mu_p'].append(mu_p.cpu())
-                results['kappa_p'].append(kappa_p.cpu())
-                results['mu_q'].append(mu_q.cpu())
-                results['kappa_q'].append(kappa_q.cpu())
+                results['p'].append(p_t.cpu()); results['q'].append(q.cpu())
+                results['gravity_p'].append(g_p.cpu()); results['gravity_q'].append(g_q.cpu())
+                results['mu_p'].append(mu_p.cpu()); results['kappa_p'].append(kappa_p.cpu())
+                results['mu_q'].append(mu_q.cpu()); results['kappa_q'].append(kappa_q.cpu())
     
+    # -----------------------------------------------------------
+    # 3. Finalize & Merge Metrics into log_dict
+    # -----------------------------------------------------------
+    # 기존 log_dict 복사 (마지막 배치의 Loss 정보 등 포함)
+    final_log_dict = last_log_dict.copy()
+    
+    # 통합된 Avg Loss 업데이트
+    final_log_dict['val_loss'] = AvgMeter_val.avg
+    
+    # Integration 결과가 있으면 평균을 내서 log_dict에 추가
+    if integrate and len(rot_errors_list) > 0:
+        all_r = torch.cat(rot_errors_list)
+        all_t = torch.cat(trans_errors_list)
+        
+        final_log_dict['R_error_mean'] = all_r.mean().item()
+        final_log_dict['R_error_med'] = all_r.median().item()
+        final_log_dict['T_error_mean'] = all_t.mean().item()
+        final_log_dict['T_error_med'] = all_t.median().item()
+        
+        print(f"\n=== Validation Result (Epoch {epoch}) ===")
+        print(f"  R_Error: {final_log_dict['R_error_mean']:.4f}° (Mean), {final_log_dict['R_error_med']:.4f}° (Med)")
+        print(f"  T_Error: {final_log_dict['T_error_mean']:.4f} (Mean), {final_log_dict['T_error_med']:.4f} (Med)")
+
+    # -----------------------------------------------------------
+    # 4. Return
+    # -----------------------------------------------------------
     if visualize:
         for key in results:
-            results[key] = torch.cat(results[key], dim=0)
+            if len(results[key]) > 0:
+                results[key] = torch.cat(results[key], dim=0)
+        # visualize=True일 때는 (Loss, Results) 반환 (기존 로직 유지)
         return AvgMeter_val.avg, results
     
-    return AvgMeter_val.avg, log_dict
+    # 평소에는 (Loss, Log_dict) 반환
+    return AvgMeter_val.avg, final_log_dict
 
+def compute_errors(T_pred, T_gt):
+    """
+    Compute rotation (degree) and translation errors
+    """
+    # 1. Rotation Error
+    R_gt = T_gt[:, :3, :3]
+    R_pred = T_pred[:, :3, :3]
+    
+    R_diff = torch.matmul(R_gt.transpose(1, 2), R_pred)
+    trace = R_diff.diagonal(dim1=-2, dim2=-1).sum(-1)
+    
+    cos_theta = (trace - 1) / 2
+    cos_theta = torch.clamp(cos_theta, -1.0 + 1e-6, 1.0 - 1e-6)
+    
+    rot_err_rad = torch.acos(cos_theta)
+    rot_err_deg = rot_err_rad * (180 / np.pi)
+    
+    # 2. Translation Error
+    t_gt = T_gt[:, :3, 3]
+    t_pred = T_pred[:, :3, 3]
+    trans_err = torch.norm(t_gt - t_pred, dim=1)
+    
+    return rot_err_deg, trans_err
 def logging_tensorboard(writer, result, epoch, optimizer):
     
     train_loss = result['train_loss']

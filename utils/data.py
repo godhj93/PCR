@@ -215,7 +215,7 @@ class RegistrationDataset(Dataset):
         
     def __getitem__(self, item):
         # ---------------------------------------------------------------------
-        # 1. Point Cloud 데이터 가져오기
+        # 1. Point Cloud 데이터 가져오기 (기존 동일)
         # ---------------------------------------------------------------------
         if self.dataset_name == 'modelnet40':
             pointcloud = self.data[item][:self.num_points]
@@ -225,34 +225,29 @@ class RegistrationDataset(Dataset):
             
             if self.partition == 'train':
                 idx = np.random.choice(total_pts, self.num_points, replace=False)
-                
             else:
                 np.random.seed(item) 
                 idx = np.random.choice(total_pts, self.num_points, replace=False)
             pointcloud = self.bunny_points[idx]
 
         # ---------------------------------------------------------------------
-        # 2. Normalization (Unit Sphere)
+        # 2. Normalization (기존 동일)
         # ---------------------------------------------------------------------
         centroid = np.mean(pointcloud, axis=0)
         pointcloud = pointcloud - centroid
         max_dist = np.max(np.sqrt(np.sum(pointcloud**2, axis=1)))
         pointcloud = pointcloud / (max_dist + 1e-8)
         
-        # [Backup] 원본(Canonical) 데이터 저장 (Evaluation용 GT)
         p_canonical = pointcloud.copy()
         
         # ---------------------------------------------------------------------
-        # 3. Source(P) Augmentation (랜덤 회전)
+        # 3. Augmentation (기존 동일)
         # ---------------------------------------------------------------------
-        # P를 위한 독립적인 시드 생성 (Test 시 고정, Train 시 랜덤)
-        # item + 100000을 하여 Q의 회전과 패턴이 겹치지 않게 함
         seed_p = item + 100000 if self.partition != 'train' else None
         seed_q = item if self.partition != 'train' else None
         seed_crop_p = item + 200000 if self.partition != 'train' else None
         seed_crop_q = item + 300000 if self.partition != 'train' else None
         
-        # Rotations
         R_src, _ = self._generate_rotation(seed_p)
         R_ab, euler_ab = self._generate_rotation(seed_q)
         R_ba = R_ab.T
@@ -277,23 +272,18 @@ class RegistrationDataset(Dataset):
             Q0 = (R_ab @ Q0_base.T).T + translation_ab[None, :]
             
             corr = np.zeros((self.num_points, 2), dtype='int64')
-            P_raw = P_crop
         
         else:
-            # Full Overlap (기존 로직)
             P0 = (R_src @ p_canonical.T).T
             Q0 = (R_ab @ P0.T).T + translation_ab[None, :]
             
-            # Shuffle
             N = self.num_points
             perm_p = np.random.permutation(N)
             perm_q = np.random.permutation(N)
             
             P0 = P0[perm_p]
             Q0 = Q0[perm_q]
-            P_raw = p_canonical[perm_p]
             
-            # GT Correspondence
             inv_perm_p = np.argsort(perm_p)
             inv_perm_q = np.argsort(perm_q)
             corr = np.stack([inv_perm_p, inv_perm_q], axis=1).astype('int64')
@@ -308,91 +298,72 @@ class RegistrationDataset(Dataset):
             Q0 = jitter_pointcloud(Q0)
 
         # ---------------------------------------------------------------------
-        # ! New: Flow Matching Path Generation
+        # 4. Flow Matching Path Generation
         # ---------------------------------------------------------------------
-        P_t_out = None
-        v_target_out = None
-        t_out = None
-        g_p_t_out = None
-
-    
-        # 1. Prepare T_gt (Relative Pose from P0 to Q0)
-        # P0 -> Q0 : Q0 = R_ab * P0 + t_ab
-        # T_gt = [[R_ab, t_ab], [0, 1]]
         T_gt = torch.eye(4)
         T_gt[:3, :3] = torch.from_numpy(R_ab)
         T_gt[:3, 3] = torch.from_numpy(translation_ab)
         
-        # 2. Sample random time t
-        # 배치 처리를 위해 (1,) 형태로 생성
         t_scalar = torch.rand(1)
         
-        # 3. Path Sampling (CPU)
-        x_0 = torch.eye(4).unsqueeze(0) # Identity (P0 기준)
-        x_1 = T_gt.unsqueeze(0)         # Target (Q0 기준)
-        t_tensor = t_scalar
+        x_0 = torch.eye(4).unsqueeze(0)
+        x_1 = T_gt.unsqueeze(0)
         
-        # Generator 실행 (Gradient 불필요)
         with torch.no_grad():
-            path_sample = self.path_generator.sample(x_0, x_1, t_tensor)
+            path_sample = self.path_generator.sample(x_0, x_1, t_scalar)
             
-        # 결과 추출 (Tensor)
-        T_t_mat = path_sample.x_t.squeeze(0)   # (4, 4) Current Pose
-        v_target = path_sample.dx_t.squeeze(0) # (6,) Target Velocity
+        T_t_mat = path_sample.x_t.squeeze(0)   
+        v_target = path_sample.dx_t.squeeze(0) 
         
-        # 4. Apply T_t to P0 (Generate P_t)
-        # P_t = R_t * P0 + t_t
-        # 주의: P0는 numpy (N, 3) -> Tensor 변환 필요
-        P0_tensor = torch.from_numpy(P0).float() # (N, 3)
-        
+        # P_t 생성 (Tensor 연산)
+        P0_tensor = torch.from_numpy(P0).float() 
         R_t = T_t_mat[:3, :3]
         t_t = T_t_mat[:3, 3]
         
-        # (N, 3) @ (3, 3)^T + (3,) => (N, 3)
-        P_t = torch.matmul(P0_tensor, R_t.T) + t_t
+        # P_t = P0 @ R_t^T + t_t
+        P_t_tensor = torch.matmul(P0_tensor, R_t.T) + t_t
         
-        # 5. Compute Gravity at time t (for Perception Loss)
-        # g_p(t) = R_t * g_p(0)
-        # g_p는 현재 numpy (3,) -> Tensor 변환
+        # Gravity 보정 (Label Alignment)
         g_p_tensor = torch.from_numpy(g_p).float()
         g_p_t = torch.matmul(R_t, g_p_tensor)
+        g_p_t = g_p_t / (torch.norm(g_p_t) + 1e-8) # Normalization
+
+        # ---------------------------------------------------------------------
+        # 5. [핵심 수정] Transpose & Memory Optimization
+        # (N, 3) -> (3, N) 변환을 수행하되, np.ascontiguousarray를 사용하여
+        # 메모리 구조를 정리합니다. 이렇게 하면 DataLoader 속도가 빨라지고
+        # 모델이 좌표(XYZ)를 헷갈리지 않아 Kappa가 정상적으로 증가합니다.
+        # ---------------------------------------------------------------------
         
-        # Output 저장 (Tensor 상태로 반환)
-        P_t_out = P_t
-        v_target_out = v_target
-        t_out = t_scalar
-        g_p_t_out = g_p_t
+        # 1) Numpy Data (P0, Q0)
+        p_out = np.ascontiguousarray(P0.T).astype('float32')
+        q_out = np.ascontiguousarray(Q0.T).astype('float32')
         
-        # Return Dictionary 구성
-        # P0, Q0 등 기존 데이터도 필요하면 Tensor로 변환하거나 그대로 둠
-        # PyTorch DataLoader는 numpy array를 자동으로 Tensor로 collate 해줌
+        # 2) Tensor Data (P_t) -> Numpy -> Contiguous Transpose
+        P_t_np = P_t_tensor.numpy()
+        P_t_out = np.ascontiguousarray(P_t_np.T).astype('float32')
         
         return_dict = {
-            'p': P0.astype('float32'),          
-            'q': Q0.astype('float32'),          
+            # === Inputs (All 3xN, Contiguous) ===
+            'p': torch.from_numpy(p_out),       # (3, N)
+            'q': torch.from_numpy(q_out),       # (3, N)
+            'P_t': torch.from_numpy(P_t_out),   # (3, N) -> 모델 입력
             
-            # Existing Metadatas
+            # === Labels ===
+            't': t_scalar,
+            'v_target': v_target,
+            'g_p_init': torch.from_numpy(g_p),
+            'g_p_t': g_p_t,                     # 회전된 중력 (학습 핵심)
+            'g_q': torch.from_numpy(g_q),
+            
+            # === Metadata ===
             'R_src': R_src.astype('float32'),       
             'R_pq': R_ab.astype('float32'),         
             't_pq': translation_ab.astype('float32'),
             'corr_idx': corr,
-            
-            # ! New: Gravity Info (기존 g_p는 t=0 시점, g_p_t는 t 시점)
-            'g_p_init': g_p,  
-            'g_q': g_q,   
         }
-        
-        # ! New: Flow Matching Data 추가
-        if P_t_out is not None:
-            return_dict.update({
-                'P_t': P_t_out,         # (N, 3) Tensor
-                't': t_out,             # (1,) Tensor
-                'v_target': v_target_out, # (6,) Tensor
-                'g_p_t': g_p_t_out,     # (3,) Tensor (Current Gravity)
-            })
 
         return return_dict
-    
         
     def __len__(self):
         if self.dataset_name == 'modelnet40':

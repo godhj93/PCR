@@ -17,8 +17,8 @@ hydra:
 device: cuda:0
 
 training:
-  batch_size: 32
-  epochs: 300
+  batch_size: 128
+  epochs: 100
   
 test:
   num_steps: 10
@@ -43,4 +43,5 @@ data:
 
 loss:
   _target_: utils.loss.ELBOObjective
+  alpha: 1.0
   beta: 1.0

@@ -144,6 +144,7 @@ class PointNet_VN_Gravity_Bayes_v2(nn.Module):
             
             # Concatenate to form 9-channel input
             x = torch.cat([pos, n_xx, n_yy, n_zz, n_xy, n_xz, n_yz], dim=1) 
+            # x = torch.cat([pos, n, n_xx, n_yy, n_zz, n_xy, n_xz, n_yz], dim=1)
             
             x = self.std_fc1(x)
             x = self.std_fc2(x)
@@ -317,7 +318,7 @@ class GravityVelocityDecoder(nn.Module):
         # 1. Time Embedding
         self.time_embed = TimeEmbedding(time_embed_dim)
         
-        # 2. Feature Adapter (Geometry Projection)
+        # 2. Feature Adapter
         if self.encoder_mode == 'equi':
             input_feat_dim = feat_dim * 3
         else:
@@ -329,51 +330,57 @@ class GravityVelocityDecoder(nn.Module):
             nn.SiLU()
         )
         
-        # 3. Physics Adapter (Query Generation)
-        # Physics Input: Mu(3*2) + Kappa(1*2) + Time(time_dim)
-        physics_dim = (3 * 2) + (1 * 2) + time_embed_dim
+        # 3. Physics Adapter (수정됨!)
+        # 기존: Mu(3*2) + Kappa(1*2) + Time
+        # 변경: Sampled_G(3*2) + Time
+        # Kappa는 더 이상 입력으로 받지 않음 (노이즈로 녹아들어감)
+        physics_dim = (3 * 2) + time_embed_dim 
+        
         self.physics_proj = nn.Sequential(
             nn.Linear(physics_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.SiLU()
         )
         
-        # 4. Cross Attention (Fusion)
-        # Physics(Query) -> Geometry(Key/Value)
+        # 4. Cross Attention
         self.cross_attn = PhysicsAttention(hidden_dim, num_heads=8)
         
         # 5. Velocity Head
         self.head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim), # Attention 결과(hidden_dim)만 받음
+            nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, 6) # se(3) velocity
+            nn.Linear(hidden_dim, 6)
         )
+        
+        # Zero Init (안정적인 학습 시작을 위해 추천)
+        nn.init.uniform_(self.head[-1].weight, -1e-5, 1e-5)
+        nn.init.constant_(self.head[-1].bias, 0)
 
-    def forward(self, g_p, g_q, mu_p, mu_q, kappa_p, kappa_q, t):
+    def forward(self, g_p, g_q, g_sample_p, g_sample_q, t):
+        # 인자 변경: mu_p, kappa_p -> g_sample_p (샘플링된 중력)
+        
         B = g_p.shape[0]
         
-        # --- [Step 1] Prepare Geometry (Key/Value) ---
+        # --- [Step 1] Prepare Geometry ---
         flat_p = g_p.reshape(B, -1)
         flat_q = g_q.reshape(B, -1)
-        
-        h_p = self.geom_proj(flat_p) # [B, D]
-        h_q = self.geom_proj(flat_q) # [B, D]
-        
-        # Stack Geometry context: [B, 2, D]
+        h_p = self.geom_proj(flat_p)
+        h_q = self.geom_proj(flat_q)
         geom_kv = torch.stack([h_p, h_q], dim=1)
         
-        # --- [Step 2] Prepare Physics (Query) ---
+        # --- [Step 2] Prepare Physics (수정됨!) ---
         t_emb = self.time_embed(t)
         
-        # Concatenate Physics inputs
-        phys_raw = torch.cat([mu_p, mu_q, kappa_p, kappa_q, t_emb], dim=1) # [B, physics_dim]
-        phys_q = self.physics_proj(phys_raw).unsqueeze(1) # [B, 1, D]
+        # Mu, Kappa 대신 샘플링된 벡터를 사용
+        # g_sample: [B, 3] (노이즈가 섞인 중력)
+        phys_raw = torch.cat([g_sample_p, g_sample_q, t_emb], dim=1) 
         
-        # --- [Step 3] Cross Attention Fusion ---
-        # "물리적 상황(Query)에 맞춰 기하학적 정보(KV)를 긁어오기"
-        fused_feat = self.cross_attn(query=phys_q, key_value=geom_kv) # [B, 1, D]
-        fused_feat = fused_feat.squeeze(1) # [B, D]
+        phys_q = self.physics_proj(phys_raw).unsqueeze(1)
+        
+        # --- [Step 3] Cross Attention ---
+        fused_feat = self.cross_attn(query=phys_q, key_value=geom_kv)
+        fused_feat = fused_feat.squeeze(1)
         
         # --- [Step 4] Predict ---
         v_pred = self.head(fused_feat)
@@ -383,28 +390,57 @@ class GravityVelocityDecoder(nn.Module):
 class GravityFlowAgent(nn.Module):
     def __init__(self, pooling='attentive', mode='normal', stride=4):
         super().__init__()
-        self.encoder = PointNet_VN_Gravity_Bayes_v2(pooling = pooling, mode=mode, stride=stride)
+        self.encoder = PointNet_VN_Gravity_Bayes_v2(pooling=pooling, mode=mode, stride=stride)
         self.decoder = GravityVelocityDecoder(
             feat_dim=self.encoder.feat_dim,
             encoder_mode=self.encoder.mode
         )
 
-    def forward(self, x, t, context_q):
-        # Transpose 처리
-        # if x.shape[1] != 3 and x.shape[2] == 3: x = x.transpose(1, 2)
-        # if context_q.shape[1] != 3 and context_q.shape[2] == 3: context_q = context_q.transpose(1, 2)
+    def reparameterize(self, mu, kappa):
+        """
+        vMF Reparameterization Trick (Gaussian Approximation)
+        input: mu (B, 3), kappa (B, 1)
+        output: sampled_vector (B, 3)
+        """
+        # Training 모드일 때만 노이즈 주입
+        if self.training:
+            # 1. Generate Noise epsilon ~ N(0, I)
+            eps = torch.randn_like(mu)
+            
+            # 2. Scale Noise by Uncertainty (1/sqrt(kappa))
+            # kappa가 작으면(불확실하면) 노이즈가 커짐 -> Decoder가 고통받음 -> kappa를 키우게 됨
+            # kappa에 1e-6을 더해 0으로 나누는 것 방지
+            scaled_noise = eps / torch.sqrt(kappa + 1e-6)
+            
+            # 3. Add to Mean
+            # 접평면 투영 등 복잡한 것보다, 단순히 더하고 정규화하는 게 학습엔 더 효과적임
+            z = mu + scaled_noise
+            
+            # 4. Normalize to unit sphere
+            return F.normalize(z, p=2, dim=1)
+        else:
+            # Test/Validation 시에는 노이즈 없이 평균값(mu) 사용
+            return mu
 
+    def forward(self, x, t, context_q):
         # 1. 상태 인지 (Perception)
+        # Encoder는 기존과 동일하게 mu, kappa를 뱉음
         feat_p, feat_q, mu_p, mu_q, kappa_p, kappa_q = self.encoder(x, context_q, return_feat=True)
         
-        # 2. 행동 결정 (Action)
+        # 2. 샘플링 (핵심!)
+        # 여기서 미분 가능한 샘플링 수행
+        g_sample_p = self.reparameterize(mu_p, kappa_p)
+        g_sample_q = self.reparameterize(mu_q, kappa_q)
+        
+        # 3. 행동 결정 (Action)
+        # Decoder에게는 파라미터 대신 '샘플'을 줌
         v_pred = self.decoder(
             g_p=feat_p, g_q=feat_q,
-            mu_p=mu_p, mu_q=mu_q,
-            kappa_p=kappa_p, kappa_q=kappa_q,
+            g_sample_p=g_sample_p, g_sample_q=g_sample_q, # 변경된 입력
             t=t
         )
         
+        # 반환값은 그대로 유지 (Loss 계산에는 원본 mu, kappa가 필요하므로)
         return v_pred, (mu_p, kappa_p), (mu_q, kappa_q)
     
 if __name__ == '__main__':

@@ -74,8 +74,9 @@ class ELBOObjective(nn.Module):
     Maximize ELBO <=> Minimize Loss
     Loss = Action_Loss + beta * Perception_Loss
     """
-    def __init__(self, beta: float = 1.0):
+    def __init__(self, alpha: float = 1.0, beta: float = 1.0):
         super().__init__()
+        self.alpha = alpha
         self.beta = beta
         self.perception_loss_fn = VMFLoss()
         self.action_loss_fn = FlowStepLoss()
@@ -108,7 +109,7 @@ class ELBOObjective(nn.Module):
         perception_loss = (loss_g_p + loss_g_q) * 0.5
 
         # 3. Total Loss (Negative ELBO)
-        total_loss = action_loss + self.beta * perception_loss
+        total_loss = self.alpha * action_loss + self.beta * perception_loss
         
         return total_loss, {
             "total_loss": total_loss.item(),
