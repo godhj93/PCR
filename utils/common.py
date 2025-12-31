@@ -231,7 +231,7 @@ def test_one_epoch(model, test_loader, loss_fn, metric, cfg, epoch=0, visualize=
             # -----------------------------------------------------------
             # Logging (Pbar Description)
             # -----------------------------------------------------------
-            desc = f"Ep [{epoch}] Val Loss: {AvgMeter_val.avg:.4f}"
+            desc = f"Epochs [{epoch} / {cfg.training.epochs}] Val Loss: {AvgMeter_val.avg:.4f}"
             if integrate:
                 desc += f" | R: {current_r_err:.2f}°, T: {current_t_err:.4f}"
             pbar.set_description(desc)

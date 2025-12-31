@@ -17,7 +17,7 @@ hydra:
 device: cuda:0
 
 training:
-  batch_size: 128
+  batch_size: 32
   epochs: 100
   
 test:
