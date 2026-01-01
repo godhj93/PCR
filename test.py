@@ -301,7 +301,7 @@ class ICPSolvers:
             
             # [KEY] Kappa-based Hypothesis Testing
             P_indices = np.arange(len(P_curr))
-            is_inlier_neural, _ = self.model.check_correspondence_validity(
+            is_inlier_neural, _ = self.model.encoder.check_correspondence_validity(
                 batch_idx=self.batch_idx, P_indices=P_indices, Q_indices=indices,
                 g_p=self.neural_preds['mu_p'], kappa_p=self.neural_preds['kappa_p'],
                 g_q=self.neural_preds['mu_q'], kappa_q=self.neural_preds['kappa_q'],
@@ -375,6 +375,60 @@ class ICPSolvers:
         P_final = (R_total @ self.P_raw.T).T + t_total
         return P_final, R_total, t_total
 
+    def run_neural_prediction(self):
+        """ 
+        Flow Model: ODE integration using predicted velocity field.
+        (Centering Logic Removed as requested)
+        """
+        if self.model is None: 
+            return self.P_raw, np.eye(3), np.zeros(3)
+        
+        device = next(self.model.parameters()).device
+        
+        # [Step 1] Raw Input Preparation (No Centering)
+        # P_raw를 그대로 Tensor로 변환하여 사용합니다.
+        P_raw_tensor = torch.from_numpy(self.P_raw).float().to(device).unsqueeze(0).transpose(1, 2)
+        Q_target = torch.from_numpy(self.Q_raw).float().to(device).unsqueeze(0).transpose(1, 2)
+        
+        # [Step 2] 초기 포즈 설정 (T_init)
+        # Centering을 하지 않으므로, 원점(Identity)에서 시작하거나
+        # 필요하다면 여기서 초기 위치를 잡아줄 수 있습니다.
+        # 일단 "Centering 제거" 요청에 맞춰 완전한 Identity에서 시작합니다.
+        T_init = torch.eye(4, device=device).unsqueeze(0)
+        
+        # [Step 3] Solver 설정
+        from utils.se3 import SE3
+        from utils.inference import SE3VectorField, RiemannianEulerSolver
+        
+        se3_manifold = SE3().to(device)
+        
+        # Vector Field에 Centered가 아닌 P_raw_tensor를 넘깁니다.
+        vf = SE3VectorField(self.model, P_raw_tensor, Q_target) 
+        
+        solver = RiemannianEulerSolver(
+            vector_field=vf,
+            manifold=se3_manifold,
+            step_size=0.1 # t=0 -> t=1 (10 steps)
+        )
+        
+        # [Step 4] 적분 수행 (AttributeError 방지 수정)
+        # sample() 대신 sample_trajectory()를 호출하고 마지막 스텝([-1])을 가져옵니다.
+        trajectory = solver.sample_trajectory(T_init, t0=0.0, t1=1.0)
+        T_pred = trajectory[-1] # (1, 4, 4)
+        
+        # [Step 5] 결과 적용
+        T_pred_np = T_pred[0].detach().cpu().numpy()
+        R_pred = T_pred_np[:3, :3]
+        t_pred = T_pred_np[:3, 3]
+        
+        # P_raw에 대해 예측된 R, t를 바로 적용
+        P_final = (R_pred @ self.P_raw.T).T + t_pred
+        
+        # t_total은 별도의 보정 없이 예측값 그대로입니다.
+        t_total = t_pred
+        
+        return P_final, R_pred, t_total
+
 # ==================================================================================
 # 3. Visualization & Main Logic
 # ==================================================================================
@@ -413,7 +467,7 @@ def visualize_samples(ckpt_path, model, chi2, method, loader, num_samples=50):
     
     algo_names = [
         "Standard", "Gravity(GT)", "YawSearch", "Inc(GT)", "Fused(GT)", 
-        "DNN", "BNN", "BNN(Iter)"
+        "Model(Flow)", "DNN", "BNN", "BNN(Iter)"
     ]
     stats = {name: [] for name in algo_names}
     total_processed = 0
@@ -434,15 +488,17 @@ def visualize_samples(ckpt_path, model, chi2, method, loader, num_samples=50):
             p_tensor = batch['p'].to(device)
             q_tensor = batch['q'].to(device)
             
-            (mu_p_b, k_p_b), (mu_q_b, k_q_b) = model(p_tensor, q_tensor)
+            # GravityFlowAgent requires (x, t, context_q)
+            t_dummy = torch.zeros(p_tensor.shape[0], 1, device=device)
+            _, (mu_p_b, k_p_b), (mu_q_b, k_q_b) = model(p_tensor, t_dummy, q_tensor)
             
-            batch_p_normals_backup = model.p_normals
-            batch_q_normals_backup = model.q_normals
+            batch_p_normals_backup = model.encoder.p_normals
+            batch_q_normals_backup = model.encoder.q_normals
             
             src_batch = batch['p'].numpy().transpose(0, 2, 1) 
             tgt_batch = batch['q'].numpy().transpose(0, 2, 1)
-            grav_p_gt_batch = batch['gravity_p'].numpy()
-            grav_q_gt_batch = batch['gravity_q'].numpy()
+            grav_p_gt_batch = batch['g_p_init'].numpy()
+            grav_q_gt_batch = batch['g_q'].numpy()
             R_gt_batch = batch['R_pq'].numpy()
             t_gt_batch = batch['t_pq'].numpy()
             
@@ -450,8 +506,9 @@ def visualize_samples(ckpt_path, model, chi2, method, loader, num_samples=50):
             for i in range(batch_size):
                 if total_processed >= num_samples: break
                 
-                model.p_normals = batch_p_normals_backup
-                model.q_normals = batch_q_normals_backup
+                # Set normals for current sample only (batch_idx will be 0)
+                model.encoder.p_normals = batch_p_normals_backup[i:i+1]
+                model.encoder.q_normals = batch_q_normals_backup[i:i+1]
                 
                 P_raw = src_batch[i]; Q = tgt_batch[i]
                 g_p_gt = grav_p_gt_batch[i]; g_q_gt = grav_q_gt_batch[i]
@@ -462,9 +519,10 @@ def visualize_samples(ckpt_path, model, chi2, method, loader, num_samples=50):
                 }
                 
                 # ! New Implementation: Pass method
+                # batch_idx=0 because we sliced normals to single sample
                 solver = ICPSolvers(P_raw, Q, g_p_gt, g_q_gt, 
                                     neural_model=model, neural_preds=neural_preds_init, 
-                                    batch_idx=i, chi2_thresh=chi2, method=method)
+                                    batch_idx=0, chi2_thresh=chi2, method=method)
                 
                 ir_thresh = 3.0 * solver._get_resolution(P_raw)
                 P_gt = (R_gt_batch[i] @ P_raw.T).T + t_gt_batch[i]
@@ -480,6 +538,7 @@ def visualize_samples(ckpt_path, model, chi2, method, loader, num_samples=50):
                     elif algo == "YawSearch": P_res, R_res, t_res = solver.run_gravity_yaw_search_icp()
                     elif algo == "Inc(GT)": P_res, R_res, t_res = solver.run_gravity_inclination_icp()
                     elif algo == "Fused(GT)": P_res, R_res, t_res = solver.run_fused_icp()
+                    elif algo == "Model(Flow)": P_res, R_res, t_res = solver.run_neural_prediction()
                     elif algo == "DNN": P_res, R_res, t_res = solver.run_neural_no_kappa_icp() 
                     elif algo == "BNN": P_res, R_res, t_res = solver.run_neural_constrained_icp() 
                     
@@ -490,7 +549,8 @@ def visualize_samples(ckpt_path, model, chi2, method, loader, num_samples=50):
                         max_outer_iter = 5 
                         for iter_idx in range(max_outer_iter):
                             p_tensor_curr = torch.from_numpy(P_curr).float().to(device).transpose(0, 1).unsqueeze(0)
-                            (mu_p_curr, k_p_curr), _ = model(p_tensor_curr, q_tensor[i].unsqueeze(0))
+                            t_curr = torch.zeros(1, 1, device=device)
+                            _, (mu_p_curr, k_p_curr), _ = model(p_tensor_curr, t_curr, q_tensor[i].unsqueeze(0))
                             curr_preds = {
                                 'mu_p': mu_p_curr[0], 'kappa_p': k_p_curr[0],
                                 'mu_q': mu_q_b[i],    'kappa_q': k_q_b[i] 
@@ -527,12 +587,12 @@ def visualize_samples(ckpt_path, model, chi2, method, loader, num_samples=50):
                 row_str = f"{total_processed:<{CW_ID}} | " + " | ".join(log_strs)
                 print(row_str)
                 
-                fig = plt.figure(figsize=(20, 20))
-                ax1 = fig.add_subplot(3, 3, 1, projection='3d')
+                fig = plt.figure(figsize=(24, 18))
+                ax1 = fig.add_subplot(3, 4, 1, projection='3d')
                 draw_result(ax1, P_raw + (solver.centroid_Q - solver.centroid_P), Q, g_p_gt, g_q_gt, "Input (Std Init)", ir_thresh=ir_thresh)
                 for idx, algo in enumerate(algo_names):
-                    ax = fig.add_subplot(3, 3, idx+2, projection='3d')
-                    g_vis = neural_preds_init['mu_p'].detach().cpu().numpy() if "Neural" in algo or "BNN" in algo or "DNN" in algo else g_p_gt
+                    ax = fig.add_subplot(3, 4, idx+2, projection='3d')
+                    g_vis = neural_preds_init['mu_p'].detach().cpu().numpy() if "Neural" in algo or "BNN" in algo or "DNN" in algo or "Model" in algo else g_p_gt
                     draw_result(ax, results[algo], Q, g_vis, g_q_gt, algo, f"RRE:{stats[algo][-1][0]:.1f}", ir_thresh=ir_thresh)
                 plt.tight_layout()
                 plt.savefig(os.path.join(save_dir, f"sample_{total_processed}.png"))

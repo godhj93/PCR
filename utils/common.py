@@ -90,7 +90,7 @@ def get_rotation_from_vectors(u, v):
 def train_one_epoch(model, data_loader, optimizer, loss_fn, epoch, metric, cfg):
     
     model.train() 
-    pbar = tqdm(data_loader['train'], ncols=0)
+    pbar = tqdm(data_loader['train'], ncols=0, leave = False)
     AvgMeter_train = metric['train']
     
     for batch in pbar:
@@ -143,7 +143,7 @@ def test_one_epoch(model, test_loader, loss_fn, metric, cfg, epoch=0, visualize=
     rot_errors_list = []
     trans_errors_list = []
     
-    pbar = tqdm(test_loader, ncols=0)
+    pbar = tqdm(test_loader, ncols=0, leave = False)
     
     # Visualization 결과 저장소
     if visualize:
@@ -231,7 +231,7 @@ def test_one_epoch(model, test_loader, loss_fn, metric, cfg, epoch=0, visualize=
             # -----------------------------------------------------------
             # Logging (Pbar Description)
             # -----------------------------------------------------------
-            desc = f"Epochs [{epoch} / {cfg.training.epochs}] Val Loss: {AvgMeter_val.avg:.4f}"
+            desc = f"Epoch [{epoch} / {cfg.training.epochs}] Val Loss: {AvgMeter_val.avg:.4f}"
             if integrate:
                 desc += f" | R: {current_r_err:.2f}°, T: {current_t_err:.4f}"
             pbar.set_description(desc)

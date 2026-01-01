@@ -1,40 +1,70 @@
+import os
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple
+import argparse
+import hydra
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from omegaconf import OmegaConf
+from termcolor import colored
+from typing import List, Tuple
 
-# flow_matching 라이브러리 구조 가정 (import 경로가 맞는지 확인 필요)
-from flow_matching.utils.manifolds import Manifold
-from flow_matching.solver import Solver # 만약 base class가 없다면 생략 가능
+# [가정] 사용자 정의 모듈
+from flow_matching.utils.manifolds import Manifold 
+from utils.se3 import SE3  
+from utils.data import data_loader  
+
+# -----------------------------------------------------------------------------
+# 0. Helper Functions (Metrics)
+# -----------------------------------------------------------------------------
+
+def compute_metrics(T_pred: torch.Tensor, T_gt: torch.Tensor) -> Tuple[float, float]:
+    """
+    Computes RRE (degrees) and RTE.
+    Auto-casts tensors to the same device (CPU) to avoid device mismatch.
+    """
+    # Safe device handling: Move everything to CPU for metric calculation
+    T_pred = T_pred.cpu()
+    T_gt = T_gt.cpu()
+
+    R_pred, t_pred = T_pred[:3, :3], T_pred[:3, 3]
+    R_gt, t_gt = T_gt[:3, :3], T_gt[:3, 3]
+
+    # RTE (Relative Translation Error)
+    rte = torch.norm(t_pred - t_gt).item()
+
+    # RRE (Relative Rotation Error)
+    R_diff = torch.matmul(R_gt.T, R_pred)
+    trace = torch.trace(R_diff)
+    
+    # Numerical stability clamping
+    val = (trace - 1) / 2
+    val = torch.clamp(val, -1 + 1e-6, 1 - 1e-6)
+    
+    rre_rad = torch.acos(val)
+    rre_deg = torch.rad2deg(rre_rad).item()
+    
+    return rre_deg, rte
+
+# -----------------------------------------------------------------------------
+# 1. Physics & Solver Classes
+# -----------------------------------------------------------------------------
 
 class SE3VectorField(nn.Module):
-    """
-    [Bridge Class]
-    Deep Learning Model (takes Point Cloud) <-> ODE Solver (takes SE3 Pose)
-    
-    This class wraps the trained agent and behaves like a mathematical Vector Field 
-    defined on the SE(3) manifold.
-    
-    u = V(t, x) where u in T_x SE(3)
-    """
     def __init__(self, model: nn.Module, p_src: torch.Tensor, q_tgt: torch.Tensor):
         super().__init__()
         self.model = model
-        self.p_src = p_src  # (B, 3, N) Initial Source
-        self.q_tgt = q_tgt  # (B, 3, N) Fixed Target
+        self.p_src = p_src  # (B, 3, N)
+        self.q_tgt = q_tgt  # (B, 3, N)
         
         # Ensure dimensions
         if self.p_src.shape[1] != 3: self.p_src = self.p_src.transpose(1, 2)
         if self.q_tgt.shape[1] != 3: self.q_tgt = self.q_tgt.transpose(1, 2)
 
     def _vec2mat_se3(self, v_vec: torch.Tensor) -> torch.Tensor:
-        """
-        Helper: 6D Vector -> 4x4 Lie Algebra Matrix (xi)
-        Input: (B, 6) [vx, vy, vz, wx, wy, wz]
-        Output: (B, 4, 4) se(3) matrix
-        """
         v = v_vec[..., :3]
         w = v_vec[..., 3:]
-        
         zero = torch.zeros_like(w[..., 0])
         w_hat = torch.stack([
             torch.stack([zero, -w[..., 2], w[..., 1]], dim=-1),
@@ -49,81 +79,269 @@ class SE3VectorField(nn.Module):
         return xi
 
     def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        """
-        Compute the tangent vector at current pose x.
-        
-        Args:
-            t: Scalar or (1,) tensor time
-            x: Current Pose T (B, 4, 4)
-            
-        Returns:
-            u: Tangent vector in T_x SE(3) (B, 4, 4)
-               For left-invariant metric: u = x @ xi
-        """
-        # 1. Transform Point Cloud to current pose x
-        # P_t = R * P_0 + t
+        # P_t = R_t @ P_src + t_t
         R_curr = x[..., :3, :3]
         t_curr = x[..., :3, 3].unsqueeze(-1)
         P_curr = torch.matmul(R_curr, self.p_src) + t_curr
         
-        # 2. Handle Time Input
+        # Time embedding (Robust handling)
+        # Ensure t is on the correct device
+        if isinstance(t, torch.Tensor) and t.device != x.device:
+            t = t.to(x.device)
+
         if isinstance(t, float) or t.ndim == 0:
-            t_tensor = torch.full((x.shape[0],), float(t), device=x.device)
+            t_tensor = torch.full((x.shape[0],), float(t), device=x.device).unsqueeze(1)
         else:
-            t_tensor = t.expand(x.shape[0])
+            t_tensor = t if t.ndim > 0 else t.unsqueeze(0)
             
-        # 3. Model Inference (Feedback Loop)
-        # Model returns Body Velocity (Lie Algebra vector)
-        v_body_vec, _, _ = self.model(P_curr, t_tensor, self.q_tgt)
+        # Model Inference
+        outputs = self.model(P_curr, t_tensor, self.q_tgt)
+        v_pred_vec = outputs[0] if isinstance(outputs, tuple) else outputs
         
-        # 4. Convert to Matrix (Lie Algebra xi)
-        xi_mat = self._vec2mat_se3(v_body_vec)
-        
-        # 5. Push-forward to Tangent Space
-        # u = x * xi
-        u_tangent = torch.matmul(x, xi_mat)
-        
+        # Construct Tangent Vector
+        v_mat_global = self._vec2mat_se3(v_pred_vec)
+        u_tangent = torch.matmul(v_mat_global, x) 
         return u_tangent
 
 
 class RiemannianEulerSolver:
     """
-    Riemannian Euler Solver compatible with flow_matching library style.
+    Riemannian Euler Solver with Trajectory Sampling
+    Compatible with both animation (trajectory) and benchmarking (final pose only).
     """
-    def __init__(self, vector_field: nn.Module, manifold: Manifold, step_size: float = 0.05):
+    def __init__(self, vector_field: nn.Module, manifold, step_size: float = 0.05):
         self.vector_field = vector_field
         self.manifold = manifold
         self.step_size = step_size
         
     def step(self, t: float, x: torch.Tensor) -> torch.Tensor:
-        """
-        Perform one Euler step on the manifold.
-        x_{t+1} = Exp_x( u * dt )
-        """
-        # 1. Get Tangent Vector u at x
         u = self.vector_field(t, x)
-        
-        # 2. Scale by step size
         dt = self.step_size
         v = u * dt
-        
-        # 3. Exponential Map Update
-        # x_next = x * exp(x^-1 * v) = x * exp(xi * dt)
         x_next = self.manifold.expmap(x, v)
-        
         return x_next
+
+    def sample_trajectory(self, x_init: torch.Tensor, t0: float = 0.0, t1: float = 1.0) -> List[torch.Tensor]:
+        """
+        Returns a list of batch poses [T_0, T_1, ..., T_N].
+        Used for Animation.
+        """
+        x_curr = x_init.clone()
+        # [Fix] Ensure time steps are on the same device as x_init
+        device = x_init.device
+        trajectory = [x_curr.detach().cpu()] # Save to CPU list
+        
+        steps = int((t1 - t0) / self.step_size)
+        times = torch.linspace(t0, t1, steps, device=device)
+        
+        for t in times:
+            x_curr = self.step(t, x_curr)
+            trajectory.append(x_curr.detach().cpu())
+            
+        return trajectory
 
     def sample(self, x_init: torch.Tensor, t0: float = 0.0, t1: float = 1.0) -> torch.Tensor:
         """
-        Integrate from t0 to t1.
+        [Compatibility Wrapper]
+        Returns ONLY the final pose T_N (as Tensor on GPU/Original Device).
+        Used for test.py benchmarking.
         """
         x_curr = x_init.clone()
+        device = x_init.device
         
-        # Create time steps
         steps = int((t1 - t0) / self.step_size)
-        times = torch.linspace(t0, t1, steps)
+        times = torch.linspace(t0, t1, steps, device=device)
         
         for t in times:
             x_curr = self.step(t, x_curr)
             
+        # test.py expects the tensor on the original device (CUDA), not CPU list
         return x_curr
+
+# -----------------------------------------------------------------------------
+# 2. Visualization Class
+# -----------------------------------------------------------------------------
+
+class FlowAnimator:
+    def __init__(self, p_src: torch.Tensor, q_tgt: torch.Tensor, 
+                 trajectory: List[torch.Tensor], T_gt: torch.Tensor = None):
+        self.p_src = p_src.detach().cpu().numpy()
+        self.q_tgt = q_tgt.detach().cpu().numpy()
+        self.trajectory = trajectory # List of CPU tensors
+        self.T_gt = T_gt.detach().cpu() if T_gt is not None else None
+        
+        if self.p_src.shape[0] == 3: self.p_src = self.p_src.T
+        if self.q_tgt.shape[0] == 3: self.q_tgt = self.q_tgt.T
+        
+    def _apply_transform(self, T: torch.Tensor, points: np.ndarray) -> np.ndarray:
+        # T is CPU tensor
+        R = T[:3, :3].numpy()
+        t = T[:3, 3].numpy()
+        return (points @ R.T) + t
+
+    def save_animation(self, save_path: str, fps: int = 10):
+        # Bounds calculation
+        p_gt_final = self._apply_transform(self.T_gt, self.p_src) if self.T_gt is not None else self.p_src
+        all_points = np.concatenate([self.p_src, self.q_tgt, p_gt_final], axis=0)
+        min_lim = all_points.min() - 0.5
+        max_lim = all_points.max() + 0.5
+        
+        fig = plt.figure(figsize=(10, 8))
+        ax = fig.add_subplot(111, projection='3d')
+        
+        def update(frame_idx):
+            ax.clear()
+            ax.set_xlim(min_lim, max_lim); ax.set_ylim(min_lim, max_lim); ax.set_zlim(min_lim, max_lim)
+            ax.set_xlabel('X'); ax.set_ylabel('Y'); ax.set_zlabel('Z')
+            
+            T_curr = self.trajectory[frame_idx] # (4, 4) CPU
+            
+            # Title with Metrics
+            title_txt = f"Step {frame_idx}"
+            if self.T_gt is not None:
+                # T_curr is CPU, self.T_gt is CPU -> Safe
+                rre, rte = compute_metrics(T_curr, self.T_gt)
+                title_txt += f"\nRRE: {rre:.2f}°, RTE: {rte:.4f}"
+            ax.set_title(title_txt)
+
+            # Scatter Plots
+            ax.scatter(self.q_tgt[:, 0], self.q_tgt[:, 1], self.q_tgt[:, 2], 
+                       c='blue', s=2, alpha=0.3, label='Target')
+            
+            if self.T_gt is not None:
+                p_gt = self._apply_transform(self.T_gt, self.p_src)
+                ax.scatter(p_gt[:, 0], p_gt[:, 1], p_gt[:, 2],
+                           c='green', s=2, alpha=0.2, label='GT')
+
+            p_curr = self._apply_transform(T_curr, self.p_src)
+            ax.scatter(p_curr[:, 0], p_curr[:, 1], p_curr[:, 2], 
+                       c='red', s=5, alpha=0.9, label='Flow')
+            
+            ax.legend(loc='upper right')
+            
+        ani = FuncAnimation(fig, update, frames=len(self.trajectory), interval=100)
+        
+        if save_path.endswith('.gif'):
+            ani.save(save_path, writer='pillow', fps=fps)
+        elif save_path.endswith('.mp4'):
+            ani.save(save_path, writer='ffmpeg', fps=fps)
+        plt.close()
+
+# -----------------------------------------------------------------------------
+# 3. Main Inference Controller
+# -----------------------------------------------------------------------------
+
+class FlowMatchingInference:
+    def __init__(self, ckpt_path: str, overrides: List[str] = None):
+        self.ckpt_path = ckpt_path
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.cfg = self._load_config(overrides)
+        self.model = self._load_model()
+        self.manifold = SE3() 
+
+    def _load_config(self, overrides):
+        yaml_path = os.path.join(os.path.dirname(self.ckpt_path), '.hydra', 'config.yaml')
+        if not os.path.exists(yaml_path):
+            raise FileNotFoundError(f"Config not found at {yaml_path}")
+        cfg = OmegaConf.load(yaml_path)
+        if overrides:
+            cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(overrides))
+        return cfg
+
+    def _load_model(self):
+        model = hydra.utils.instantiate(self.cfg.model).to(self.device)
+        weight_path = os.path.join(self.ckpt_path, "weights/ckpt.pt")
+        if os.path.exists(weight_path):
+            ckpt = torch.load(weight_path, map_location=self.device)
+            model.load_state_dict(ckpt['model_state_dict'], strict=False)
+            print(colored(f"[Model] Weights loaded from {weight_path}", "green"))
+        else:
+            print(colored("[Warning] Random Weights (Checkpoint not found)", "yellow"))
+        return model
+
+    def run_visualization(self, save_dir: str = "vis_outputs", max_batches: int = None):
+        os.makedirs(save_dir, exist_ok=True)
+        _, test_loader = data_loader(self.cfg) 
+        
+        self.model.eval()
+        global_idx = 0
+        
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(test_loader):
+                if max_batches is not None and batch_idx >= max_batches:
+                    break
+                    
+                # 1. Prepare Batch Data (CUDA)
+                p_init = batch['p'].to(self.device)
+                q_tgt = batch['q'].to(self.device)
+                
+                R_gt = batch['R_pq'].to(self.device)  
+                t_gt_vec = batch['t_pq'].to(self.device)  
+                
+                # GT Matrices (B, 4, 4) - CUDA
+                B = p_init.shape[0]
+                T_gt = torch.eye(4, device=self.device).unsqueeze(0).repeat(B, 1, 1)
+                T_gt[:, :3, :3] = R_gt
+                T_gt[:, :3, 3] = t_gt_vec
+
+                # 2. Batch Integration
+                vf = SE3VectorField(self.model, p_init, q_tgt)
+                solver = RiemannianEulerSolver(vf, self.manifold, step_size=0.05)
+                
+                print(colored(f"[Inference] Integrating Batch {batch_idx} (Size: {B})...", "cyan"))
+                
+                T_identity = torch.eye(4, device=self.device).unsqueeze(0).repeat(B, 1, 1) 
+                trajectory_batch = solver.sample_trajectory(T_identity, t0=0.0, t1=1.0)
+                # trajectory_batch is List of (B, 4, 4) Tensors on CPU (from solver)
+                
+                # 3. Process Each Sample
+                for b in range(B):
+                    # Extract Trajectory for sample b -> List of (4, 4) CPU Tensors
+                    traj_sample = [step_T[b] for step_T in trajectory_batch]
+                    
+                    p_sample = p_init[b] # CUDA
+                    q_sample = q_tgt[b]  # CUDA
+                    
+                    # [Fix 2] Move GT to CPU for metrics and visualization
+                    T_gt_sample = T_gt[b].cpu() 
+                    
+                    # Final Error Check
+                    T_final = traj_sample[-1] # CPU
+                    rre, rte = compute_metrics(T_final, T_gt_sample)
+                    
+                    print(colored(f"  > Sample {global_idx}: Final RRE={rre:.2f}°, RTE={rte:.4f}", "yellow"))
+                    
+                    # Animate (p_sample, q_sample will be moved to cpu inside class)
+                    animator = FlowAnimator(
+                        p_src=p_sample, 
+                        q_tgt=q_sample, 
+                        trajectory=traj_sample,
+                        T_gt=T_gt_sample 
+                    )
+                    
+                    save_name = os.path.join(save_dir, f"vis_batch{batch_idx}_sample{b}_ID{global_idx}.gif")
+                    animator.save_animation(save_name)
+                    global_idx += 1
+
+# -----------------------------------------------------------------------------
+# 4. Execution
+# -----------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ckpt", type=str, required=True, help="Checkpoint directory path")
+    parser.add_argument("--max_batches", type=int, default=1, help="Max number of batches")
+    parser.add_argument("overrides", nargs="*", help="Hydra config overrides")
+    args = parser.parse_args()
+
+    try:
+        runner = FlowMatchingInference(args.ckpt, args.overrides)
+        runner.run_visualization(save_dir=os.path.join(args.ckpt, "animations"), max_batches=args.max_batches)
+        
+    except Exception as e:
+        print(colored(f"[Fatal] Process terminated: {e}", "red"))
+        import traceback
+        traceback.print_exc() # 상세 에러 위치 확인용
+
+if __name__ == "__main__":
+    main()

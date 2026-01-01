@@ -15,7 +15,7 @@ from scipy.spatial.transform import Rotation
 from typing import Tuple, Optional
 from pathlib import Path
 import open3d as o3d
-from utils.common import visualize_registration
+# from utils.common import visualize_registration
 import matplotlib.pyplot as plt
 import hydra
 
@@ -254,7 +254,7 @@ class RegistrationDataset(Dataset):
         
         if self.partition != 'train':
             np.random.seed(item)
-        dist = 0.0
+        dist = 3.0
         translation_ab = np.array([
             np.random.uniform(-dist, dist),
             np.random.uniform(-dist, dist),
