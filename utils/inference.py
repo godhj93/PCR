@@ -10,8 +10,12 @@ from omegaconf import OmegaConf
 from termcolor import colored
 from typing import List, Tuple
 
-# [가정] 사용자 정의 모듈
+# flow_matching library imports
 from flow_matching.utils.manifolds import Manifold 
+from flow_matching.solver import RiemannianODESolver
+from flow_matching.utils import ModelWrapper
+
+# User modules
 from utils.se3 import SE3  
 from utils.data import data_loader  
 
@@ -51,10 +55,13 @@ def compute_metrics(T_pred: torch.Tensor, T_gt: torch.Tensor) -> Tuple[float, fl
 # 1. Physics & Solver Classes
 # -----------------------------------------------------------------------------
 
-class SE3VectorField(nn.Module):
+class SE3VectorField(ModelWrapper):
+    """
+    Wraps the velocity prediction model for use with RiemannianODESolver.
+    Follows the standard flow_matching ModelWrapper interface.
+    """
     def __init__(self, model: nn.Module, p_src: torch.Tensor, q_tgt: torch.Tensor):
-        super().__init__()
-        self.model = model
+        super().__init__(model)
         self.p_src = p_src  # (B, 3, N)
         self.q_tgt = q_tgt  # (B, 3, N)
         
@@ -63,8 +70,11 @@ class SE3VectorField(nn.Module):
         if self.q_tgt.shape[1] != 3: self.q_tgt = self.q_tgt.transpose(1, 2)
 
     def _vec2mat_se3(self, v_vec: torch.Tensor) -> torch.Tensor:
-        v = v_vec[..., :3]
-        w = v_vec[..., 3:]
+        """Convert 6D velocity vector to 4x4 se(3) matrix."""
+        v = v_vec[..., :3]  # Linear velocity
+        w = v_vec[..., 3:]  # Angular velocity
+        
+        # Construct skew-symmetric matrix from angular velocity
         zero = torch.zeros_like(w[..., 0])
         w_hat = torch.stack([
             torch.stack([zero, -w[..., 2], w[..., 1]], dim=-1),
@@ -72,91 +82,53 @@ class SE3VectorField(nn.Module):
             torch.stack([-w[..., 1], w[..., 0], zero], dim=-1)
         ], dim=-2)
         
+        # Construct 4x4 se(3) matrix
         B = v_vec.shape[0]
         xi = torch.zeros((B, 4, 4), device=v_vec.device, dtype=v_vec.dtype)
         xi[..., :3, :3] = w_hat
         xi[..., :3, 3] = v
         return xi
 
-    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        # P_t = R_t @ P_src + t_t
+    def forward(self, x: torch.Tensor, t: torch.Tensor, **extras) -> torch.Tensor:
+        """
+        Standard ModelWrapper interface: forward(x, t, **extras)
+        
+        Args:
+            x: (B, 4, 4) - Current SE(3) poses
+            t: (B,) or scalar - Time
+            
+        Returns:
+            u: (B, 4, 4) - Tangent vector at x in T_x SE(3)
+        """
+        # Extract current transformation
         R_curr = x[..., :3, :3]
         t_curr = x[..., :3, 3].unsqueeze(-1)
+        
+        # Transform source points to current pose
         P_curr = torch.matmul(R_curr, self.p_src) + t_curr
         
-        # Time embedding (Robust handling)
-        # Ensure t is on the correct device
-        if isinstance(t, torch.Tensor) and t.device != x.device:
-            t = t.to(x.device)
-
-        if isinstance(t, float) or t.ndim == 0:
+        # Handle time tensor formatting
+        if isinstance(t, float) or (isinstance(t, torch.Tensor) and t.ndim == 0):
             t_tensor = torch.full((x.shape[0],), float(t), device=x.device).unsqueeze(1)
         else:
-            t_tensor = t if t.ndim > 0 else t.unsqueeze(0)
+            t_tensor = t.view(-1, 1) if t.ndim == 1 else t
             
-        # Model Inference
+        # Model prediction (6D velocity vector)
         outputs = self.model(P_curr, t_tensor, self.q_tgt)
         v_pred_vec = outputs[0] if isinstance(outputs, tuple) else outputs
         
-        # Construct Tangent Vector
-        v_mat_global = self._vec2mat_se3(v_pred_vec)
-        u_tangent = torch.matmul(v_mat_global, x) 
+        # Convert to se(3) matrix (global frame)
+        xi_global = self._vec2mat_se3(v_pred_vec)
+        
+        # Convert to tangent vector at x: u = x @ xi
+        # This ensures u is in the tangent space T_x SE(3)
+        u_tangent = torch.matmul(x, xi_global)
+        
         return u_tangent
 
 
-class RiemannianEulerSolver:
-    """
-    Riemannian Euler Solver with Trajectory Sampling
-    Compatible with both animation (trajectory) and benchmarking (final pose only).
-    """
-    def __init__(self, vector_field: nn.Module, manifold, step_size: float = 0.05):
-        self.vector_field = vector_field
-        self.manifold = manifold
-        self.step_size = step_size
-        
-    def step(self, t: float, x: torch.Tensor) -> torch.Tensor:
-        u = self.vector_field(t, x)
-        dt = self.step_size
-        v = u * dt
-        x_next = self.manifold.expmap(x, v)
-        return x_next
-
-    def sample_trajectory(self, x_init: torch.Tensor, t0: float = 0.0, t1: float = 1.0) -> List[torch.Tensor]:
-        """
-        Returns a list of batch poses [T_0, T_1, ..., T_N].
-        Used for Animation.
-        """
-        x_curr = x_init.clone()
-        # [Fix] Ensure time steps are on the same device as x_init
-        device = x_init.device
-        trajectory = [x_curr.detach().cpu()] # Save to CPU list
-        
-        steps = int((t1 - t0) / self.step_size)
-        times = torch.linspace(t0, t1, steps, device=device)
-        
-        for t in times:
-            x_curr = self.step(t, x_curr)
-            trajectory.append(x_curr.detach().cpu())
-            
-        return trajectory
-
-    def sample(self, x_init: torch.Tensor, t0: float = 0.0, t1: float = 1.0) -> torch.Tensor:
-        """
-        [Compatibility Wrapper]
-        Returns ONLY the final pose T_N (as Tensor on GPU/Original Device).
-        Used for test.py benchmarking.
-        """
-        x_curr = x_init.clone()
-        device = x_init.device
-        
-        steps = int((t1 - t0) / self.step_size)
-        times = torch.linspace(t0, t1, steps, device=device)
-        
-        for t in times:
-            x_curr = self.step(t, x_curr)
-            
-        # test.py expects the tensor on the original device (CUDA), not CPU list
-        return x_curr
+# Note: RiemannianEulerSolver is now replaced by flow_matching.solver.RiemannianODESolver
+# The library version is more robust and supports multiple integration methods
 
 # -----------------------------------------------------------------------------
 # 2. Visualization Class
@@ -164,10 +136,18 @@ class RiemannianEulerSolver:
 
 class FlowAnimator:
     def __init__(self, p_src: torch.Tensor, q_tgt: torch.Tensor, 
-                 trajectory: List[torch.Tensor], T_gt: torch.Tensor = None):
+                 trajectory: torch.Tensor, T_gt: torch.Tensor = None):
+        """
+        Args:
+            p_src: Source points (3, N) or (N, 3)
+            q_tgt: Target points (3, N) or (N, 3)
+            trajectory: (T, B, 4, 4) or (T, 4, 4) - Trajectory of SE(3) poses
+            T_gt: Ground truth transformation (4, 4)
+        """
         self.p_src = p_src.detach().cpu().numpy()
         self.q_tgt = q_tgt.detach().cpu().numpy()
-        self.trajectory = trajectory # List of CPU tensors
+        # Handle trajectory from RiemannianODESolver
+        self.trajectory = trajectory.detach().cpu() if isinstance(trajectory, torch.Tensor) else trajectory
         self.T_gt = T_gt.detach().cpu() if T_gt is not None else None
         
         if self.p_src.shape[0] == 3: self.p_src = self.p_src.T
@@ -186,6 +166,12 @@ class FlowAnimator:
         min_lim = all_points.min() - 0.5
         max_lim = all_points.max() + 0.5
         
+        # Handle trajectory shape: (T, 4, 4) or (T, B, 4, 4)
+        if self.trajectory.ndim == 4:
+            trajectory = self.trajectory[:, 0]  # Take first batch element
+        else:
+            trajectory = self.trajectory
+        
         fig = plt.figure(figsize=(10, 8))
         ax = fig.add_subplot(111, projection='3d')
         
@@ -194,7 +180,7 @@ class FlowAnimator:
             ax.set_xlim(min_lim, max_lim); ax.set_ylim(min_lim, max_lim); ax.set_zlim(min_lim, max_lim)
             ax.set_xlabel('X'); ax.set_ylabel('Y'); ax.set_zlabel('Z')
             
-            T_curr = self.trajectory[frame_idx] # (4, 4) CPU
+            T_curr = trajectory[frame_idx] # (4, 4) CPU
             
             # Title with Metrics
             title_txt = f"Step {frame_idx}"
@@ -218,8 +204,10 @@ class FlowAnimator:
                        c='red', s=5, alpha=0.9, label='Flow')
             
             ax.legend(loc='upper right')
-            
-        ani = FuncAnimation(fig, update, frames=len(self.trajectory), interval=100)
+        
+        # Get number of frames
+        n_frames = trajectory.shape[0]
+        ani = FuncAnimation(fig, update, frames=n_frames, interval=100)
         
         if save_path.endswith('.gif'):
             ani.save(save_path, writer='pillow', fps=fps)
@@ -284,29 +272,40 @@ class FlowMatchingInference:
                 T_gt[:, :3, :3] = R_gt
                 T_gt[:, :3, 3] = t_gt_vec
 
-                # 2. Batch Integration
+                # 2. Batch Integration using flow_matching RiemannianODESolver
                 vf = SE3VectorField(self.model, p_init, q_tgt)
-                solver = RiemannianEulerSolver(vf, self.manifold, step_size=0.05)
+                solver = RiemannianODESolver(manifold=self.manifold, velocity_model=vf)
                 
                 print(colored(f"[Inference] Integrating Batch {batch_idx} (Size: {B})...", "cyan"))
                 
-                T_identity = torch.eye(4, device=self.device).unsqueeze(0).repeat(B, 1, 1) 
-                trajectory_batch = solver.sample_trajectory(T_identity, t0=0.0, t1=1.0)
-                # trajectory_batch is List of (B, 4, 4) Tensors on CPU (from solver)
+                T_identity = torch.eye(4, device=self.device).unsqueeze(0).repeat(B, 1, 1)
+                
+                # Use RiemannianODESolver with return_intermediates=True for trajectory
+                time_grid = torch.linspace(0.0, 1.0, 20, device=self.device)  # 20 frames
+                trajectory_batch = solver.sample(
+                    x_init=T_identity,
+                    step_size=0.05,
+                    method="midpoint",  # More accurate than euler
+                    time_grid=time_grid,
+                    return_intermediates=True,
+                    projx=True,  # Project onto manifold at each step
+                    proju=True   # Project velocity onto tangent space
+                )
+                # trajectory_batch: (T, B, 4, 4)
                 
                 # 3. Process Each Sample
                 for b in range(B):
-                    # Extract Trajectory for sample b -> List of (4, 4) CPU Tensors
-                    traj_sample = [step_T[b] for step_T in trajectory_batch]
+                    # Extract Trajectory for sample b -> (T, 4, 4) Tensor
+                    traj_sample = trajectory_batch[:, b]  # (T, 4, 4)
                     
                     p_sample = p_init[b] # CUDA
                     q_sample = q_tgt[b]  # CUDA
                     
-                    # [Fix 2] Move GT to CPU for metrics and visualization
+                    # Move GT to CPU for metrics and visualization
                     T_gt_sample = T_gt[b].cpu() 
                     
                     # Final Error Check
-                    T_final = traj_sample[-1] # CPU
+                    T_final = traj_sample[-1].cpu() # (4, 4) CPU
                     rre, rte = compute_metrics(T_final, T_gt_sample)
                     
                     print(colored(f"  > Sample {global_idx}: Final RRE={rre:.2f}°, RTE={rte:.4f}", "yellow"))

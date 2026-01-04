@@ -311,17 +311,20 @@ class RegistrationDataset(Dataset):
         
         with torch.no_grad():
             path_sample = self.path_generator.sample(x_0, x_1, t_scalar)
-            
-        T_t_mat = path_sample.x_t.squeeze(0)   
-        v_target = path_sample.dx_t.squeeze(0) 
+        
+        # path_sample.x_t: (1, 4, 4), path_sample.dx_t: (1, 6)
+        # Squeeze batch dimension to get (4, 4) and (6,)
+        T_t_mat = path_sample.x_t.squeeze(0)   # (4, 4)
+        v_target = path_sample.dx_t.squeeze(0)  # (6,)
         
         # P_t 생성 (Tensor 연산)
-        P0_tensor = torch.from_numpy(P0).float() 
-        R_t = T_t_mat[:3, :3]
-        t_t = T_t_mat[:3, 3]
+        P0_tensor = torch.from_numpy(P0).float()  # (N, 3)
+        R_t = T_t_mat[:3, :3]  # (3, 3)
+        t_t = T_t_mat[:3, 3]   # (3,)
         
         # P_t = P0 @ R_t^T + t_t
-        P_t_tensor = torch.matmul(P0_tensor, R_t.T) + t_t
+        # P0: (N, 3), R_t.T: (3, 3) -> P0 @ R_t.T: (N, 3)
+        P_t_tensor = torch.matmul(P0_tensor, R_t.transpose(0, 1)) + t_t.unsqueeze(0)  # (N, 3)
         
         # Gravity 보정 (Label Alignment)
         g_p_tensor = torch.from_numpy(g_p).float()

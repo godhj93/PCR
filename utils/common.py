@@ -4,7 +4,8 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D 
 import numpy as np
 from utils.se3 import SE3
-from utils.inference import RiemannianEulerSolver, SE3VectorField
+from utils.inference import SE3VectorField
+from flow_matching.solver import RiemannianODESolver
 
 def AverageMeter():
     """Computes and stores the average and current value"""
@@ -119,10 +120,16 @@ def train_one_epoch(model, data_loader, optimizer, loss_fn, epoch, metric, cfg):
         
         AvgMeter_train.update(loss.item(), q.size(0))
         
-        pbar.set_description(f"Epoch [{epoch} / {cfg.training.epochs}] Train Loss: {AvgMeter_train.avg:.4f}, kappa: {(kappa_p.mean() + kappa_q.mean()).item() / 2:.4f}")
+        # Progress bar with detailed loss breakdown
+        desc = (f"Epoch [{epoch}/{cfg.training.epochs}] "
+                f"Loss: {AvgMeter_train.avg:.4f} "
+                f"(Act: {log_dict['loss_action']:.4f}, "
+                f"Perc: {log_dict['loss_perception']:.4f}) "
+                f"κ: {(kappa_p.mean() + kappa_q.mean()).item() / 2:.1f}")
+        pbar.set_description(desc)
         
     # Validation
-    if epoch % 10 == 0 or epoch == cfg.training.epochs - 1:
+    if epoch % 1 == 0 or epoch == cfg.training.epochs - 1:
         integrate = True
     else:
         integrate = False
@@ -136,12 +143,14 @@ def test_one_epoch(model, test_loader, loss_fn, metric, cfg, epoch=0, visualize=
     model.eval()
     AvgMeter_val = metric['val']
     
+    # Import for integration and animation
+    from utils.inference import SE3VectorField, FlowAnimator
+    
     # Integration을 위한 매니폴드 객체 (한 번만 생성)
     se3_manifold = SE3().to(cfg.device)
     
-    # 에러 통계를 내기 위한 리스트
-    rot_errors_list = []
-    trans_errors_list = []
+    # Store first batch for later integration
+    first_batch = None
     
     pbar = tqdm(test_loader, ncols=0, leave = False)
     
@@ -159,7 +168,11 @@ def test_one_epoch(model, test_loader, loss_fn, metric, cfg, epoch=0, visualize=
     last_log_dict = {}
 
     with torch.no_grad():
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
+            
+            # Store first batch for later integration
+            if batch_idx == 0:
+                first_batch = batch
             
             # -----------------------------------------------------------
             # 1. Data Load & Loss Calculation
@@ -186,54 +199,12 @@ def test_one_epoch(model, test_loader, loss_fn, metric, cfg, epoch=0, visualize=
             last_log_dict = log_dict # 나중에 반환할 기본 log 정보 업데이트
             
             # -----------------------------------------------------------
-            # 2. Integration Logic (Optional)
-            # -----------------------------------------------------------
-            current_r_err = 0.0
-            current_t_err = 0.0
-            
-            if integrate:
-                # A. 초기 데이터 (t=0) 가져오기
-                P_init = batch['p'].to(cfg.device) # (B, 3, N) - Augmentation된 초기 소스
-                if P_init.shape[1] != 3: P_init = P_init.transpose(1, 2)
-                
-                # B. GT Pose 구성
-                R_gt = batch['R_pq'].to(cfg.device)
-                t_gt = batch['t_pq'].to(cfg.device)
-                T_gt = torch.eye(4, device=cfg.device).repeat(P_init.shape[0], 1, 1)
-                T_gt[:, :3, :3] = R_gt
-                T_gt[:, :3, 3] = t_gt
-                
-                # C. Solver 설정 (Vector Field)
-                vf = SE3VectorField(model, P_init, q)
-                
-                # Euler Solver (Step size 0.1 -> 10 Steps)
-                solver = RiemannianEulerSolver(
-                    vector_field=vf,
-                    manifold=se3_manifold,
-                    step_size=0.1 
-                )
-                
-                # D. 적분 수행 (Identity -> T_pred)
-                T_init = torch.eye(4, device=cfg.device).repeat(P_init.shape[0], 1, 1)
-                T_pred = solver.sample(T_init, t0=0.0, t1=1.0)
-                
-                # E. 에러 계산 및 저장
-                r_err, t_err = compute_errors(T_pred, T_gt)
-                rot_errors_list.append(r_err)
-                trans_errors_list.append(t_err)
-                
-                current_r_err = r_err.mean().item()
-                current_t_err = t_err.mean().item()
-
-                if visualize:
-                    results['T_pred'].append(T_pred.cpu())
-            
-            # -----------------------------------------------------------
             # Logging (Pbar Description)
             # -----------------------------------------------------------
-            desc = f"Epoch [{epoch} / {cfg.training.epochs}] Val Loss: {AvgMeter_val.avg:.4f}"
-            if integrate:
-                desc += f" | R: {current_r_err:.2f}°, T: {current_t_err:.4f}"
+            desc = (f"Val Epoch [{epoch}/{cfg.training.epochs}] "
+                    f"Loss: {AvgMeter_val.avg:.4f} "
+                    f"(Act: {log_dict['loss_action']:.4f}, "
+                    f"Perc: {log_dict['loss_perception']:.4f})")
             pbar.set_description(desc)
             
             # Visualization Data Collection
@@ -244,30 +215,117 @@ def test_one_epoch(model, test_loader, loss_fn, metric, cfg, epoch=0, visualize=
                 results['mu_q'].append(mu_q.cpu()); results['kappa_q'].append(kappa_q.cpu())
     
     # -----------------------------------------------------------
-    # 3. Finalize & Merge Metrics into log_dict
+    # 3. Integration on First Sample Only (After all batches)
     # -----------------------------------------------------------
-    # 기존 log_dict 복사 (마지막 배치의 Loss 정보 등 포함)
     final_log_dict = last_log_dict.copy()
-    
-    # 통합된 Avg Loss 업데이트
     final_log_dict['val_loss'] = AvgMeter_val.avg
     
-    # Integration 결과가 있으면 평균을 내서 log_dict에 추가
-    if integrate and len(rot_errors_list) > 0:
-        all_r = torch.cat(rot_errors_list)
-        all_t = torch.cat(trans_errors_list)
+    if integrate and first_batch is not None:
+        # Take only first sample from first batch
+        P_init = first_batch['p'].to(cfg.device)[:1]  # (1, 3, N)
+        q = first_batch['q'].to(cfg.device)[:1]       # (1, 3, N)
+        R_gt = first_batch['R_pq'].to(cfg.device)[:1]
+        t_gt = first_batch['t_pq'].to(cfg.device)[:1]
         
-        final_log_dict['R_error_mean'] = all_r.mean().item()
-        final_log_dict['R_error_med'] = all_r.median().item()
-        final_log_dict['T_error_mean'] = all_t.mean().item()
-        final_log_dict['T_error_med'] = all_t.median().item()
+        if P_init.shape[1] != 3: P_init = P_init.transpose(1, 2)
+        if q.shape[1] != 3: q = q.transpose(1, 2)
+        
+        # GT Pose
+        T_gt = torch.eye(4, device=cfg.device).unsqueeze(0)
+        T_gt[:, :3, :3] = R_gt
+        T_gt[:, :3, 3] = t_gt
+        
+        # Setup solver
+        vf = SE3VectorField(model, P_init, q)
+        solver = RiemannianODESolver(
+            manifold=se3_manifold,
+            velocity_model=vf
+        )
+        
+        # Integration
+        T_init = torch.eye(4, device=cfg.device).unsqueeze(0)
+        time_grid = torch.tensor([0.0, 1.0], device=cfg.device)
+        
+        T_pred = solver.sample(
+            x_init=T_init,
+            step_size=0.05,
+            method="midpoint",
+            time_grid=time_grid,
+            return_intermediates=False,
+            projx=True,
+            proju=True
+        )
+        
+        # Compute errors
+        r_err, t_err = compute_errors(T_pred, T_gt)
+        
+        final_log_dict['R_error'] = r_err.item()
+        final_log_dict['T_error'] = t_err.item()
         
         print(f"\n=== Validation Result (Epoch {epoch}) ===")
-        print(f"  R_Error: {final_log_dict['R_error_mean']:.4f}° (Mean), {final_log_dict['R_error_med']:.4f}° (Med)")
-        print(f"  T_Error: {final_log_dict['T_error_mean']:.4f} (Mean), {final_log_dict['T_error_med']:.4f} (Med)")
+        print(f"  R_Error: {final_log_dict['R_error']:.4f}°")
+        print(f"  T_Error: {final_log_dict['T_error']:.4f}")
 
     # -----------------------------------------------------------
-    # 4. Return
+    # 4. Generate Animation for First Sample (if integrate)
+    # -----------------------------------------------------------
+    if integrate and epoch % cfg.test.vis_every_epoch == 0 and first_batch is not None:
+        try:
+            from pathlib import Path
+            import os
+            
+            # Use already stored first batch
+            p_init = first_batch['p'].to(cfg.device)[:1]
+            q_tgt = first_batch['q'].to(cfg.device)[:1]
+            R_gt = first_batch['R_pq'].to(cfg.device)[:1]
+            t_gt = first_batch['t_pq'].to(cfg.device)[:1]
+            
+            # GT Matrix
+            T_gt = torch.eye(4, device=cfg.device).unsqueeze(0)
+            T_gt[:, :3, :3] = R_gt
+            T_gt[:, :3, 3] = t_gt
+            
+            # Setup solver with trajectory
+            vf = SE3VectorField(model, p_init, q_tgt)
+            solver = RiemannianODESolver(manifold=se3_manifold, velocity_model=vf)
+            
+            # Generate trajectory
+            T_init = torch.eye(4, device=cfg.device).unsqueeze(0)
+            time_grid = torch.linspace(0.0, 1.0, 20, device=cfg.device)
+            
+            trajectory = solver.sample(
+                x_init=T_init,
+                step_size=0.05,
+                method="midpoint",
+                time_grid=time_grid,
+                return_intermediates=True,
+                projx=True,
+                proju=True
+            )  # (T, 1, 4, 4)
+            
+            # Create animator and save
+            animator = FlowAnimator(
+                p_src=p_init[0],
+                q_tgt=q_tgt[0],
+                trajectory=trajectory[:, 0],  # (T, 4, 4)
+                T_gt=T_gt[0].cpu()
+            )
+            
+            # Save path
+            from hydra.core.hydra_config import HydraConfig
+            output_dir = Path(HydraConfig.get().runtime.output_dir)
+            anim_dir = output_dir / "animations"
+            anim_dir.mkdir(exist_ok=True)
+            
+            save_path = anim_dir / f"epoch_{epoch:03d}.gif"
+            animator.save_animation(str(save_path), fps=10)
+            print(f"\n[Animation] Saved to {save_path}")
+            
+        except Exception as e:
+            print(f"\n[Warning] Animation generation failed: {e}")
+    
+    # -----------------------------------------------------------
+    # 5. Return
     # -----------------------------------------------------------
     if visualize:
         for key in results:

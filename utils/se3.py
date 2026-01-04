@@ -20,32 +20,43 @@ class SE3(Manifold):
         Project 4x4 matrix onto SE(3).
         R is projected to SO(3) using SVD, and the last row is forced to [0, 0, 0, 1].
         """
+        # Handle shape issues from flow_matching library's geodesic function
+        # original_shape = x.shape
+        if x.dim() > 2 and x.shape[-2] != 4:
+            # Reshape from (..., 4, K, 4) to (..., 4, 4) by squeezing extra dims
+            while x.dim() > 2 and x.shape[-2] != x.shape[-1]:
+                x = x.squeeze(-2)
+        
         # x: (..., 4, 4)
         R = x[..., :3, :3]
         t = x[..., :3, 3]
         
-        # Project R onto SO(3)
-        U, _, V = torch.linalg.svd(R)
-        Vt = V  # torch.linalg.svd returns V, not V.T in some versions? 
-        # Check pytorch version: usually U, S, Vh = svd(A). So V is Vh (V transposed).
-        # Let's verify: A = U S Vh. R_proj = U Vh.
+        # Project R onto SO(3) using SVD
+        # torch.linalg.svd returns (U, S, Vh) where A = U @ diag(S) @ Vh
+        U, _, Vh = torch.linalg.svd(R)
         
-        R_proj = torch.matmul(U, Vt)
+        # Initial projection: R_proj = U @ Vh
+        R_proj = torch.matmul(U, Vh)
         
-        # Ensure determinant is 1 (fix reflection)
+        # Ensure determinant is +1 (not -1, which would be a reflection)
         det = torch.linalg.det(R_proj)
-        # Create a correction matrix D = diag(1, 1, det)
-        D = torch.eye(3, device=x.device, dtype=x.dtype).expand_as(R_proj).clone()
-        D[..., 2, 2] = det
         
-        # Corrected projection: U @ D @ Vh
-        R_proj = torch.matmul(torch.matmul(U, D), Vt)
+        # Create correction matrix: if det < 0, flip the last column of U
+        # This is equivalent to multiplying by diag(1, 1, sign(det))
+        correction = torch.ones_like(det)
+        correction[det < 0] = -1
+        
+        # Apply correction to last column of U
+        U_corrected = U.clone()
+        U_corrected[..., :, 2] = U[..., :, 2] * correction.view(-1, 1)
+        
+        # Final projection
+        R_proj = torch.matmul(U_corrected, Vh)
         
         # Reconstruct SE(3) matrix
-        x_proj = torch.eye(4, device=x.device, dtype=x.dtype).expand_as(x).clone()
+        x_proj = torch.eye(4, device=x.device, dtype=x.dtype).unsqueeze(0).expand_as(x).clone()
         x_proj[..., :3, :3] = R_proj
         x_proj[..., :3, 3] = t
-        x_proj[..., 3, :] = torch.tensor([0., 0., 0., 1.], device=x.device, dtype=x.dtype)
         
         return x_proj
 
@@ -59,6 +70,14 @@ class SE3(Manifold):
             [[ skew, vec ],
              [ 0   , 0   ]]
         """
+        # Handle shape issues
+        if x.dim() > 2 and x.shape[-2] != 4:
+            while x.dim() > 2 and x.shape[-2] != x.shape[-1]:
+                x = x.squeeze(-2)
+        if u.dim() > 2 and u.shape[-2] != 4:
+            while u.dim() > 2 and u.shape[-2] != u.shape[-1]:
+                u = u.squeeze(-2)
+        
         # Calculate x_inv
         # Since x is SE(3), inv(x) = [[R^T, -R^T t], [0, 1]]
         # But we can just use generic inverse or solve if batch size allows.
@@ -92,6 +111,14 @@ class SE3(Manifold):
         Exponential map at x.
         exp_x(u) = x * exp(x^-1 * u) = x * exp(xi)
         """
+        # Handle shape issues from geodesic interpolation
+        if x.dim() > 2 and x.shape[-2] != 4:
+            while x.dim() > 2 and x.shape[-2] != x.shape[-1]:
+                x = x.squeeze(-2)
+        if u.dim() > 2 and u.shape[-2] != 4:
+            while u.dim() > 2 and u.shape[-2] != u.shape[-1]:
+                u = u.squeeze(-2)
+        
         # u is typically in T_x SE(3), so x^-1 u is in se(3).
         # We can compute matrix exponential directly.
         
@@ -111,6 +138,14 @@ class SE3(Manifold):
         Logarithmic map at x.
         log_x(y) = x * log(x^-1 * y)
         """
+        # Handle shape issues
+        if x.dim() > 2 and x.shape[-2] != 4:
+            while x.dim() > 2 and x.shape[-2] != x.shape[-1]:
+                x = x.squeeze(-2)
+        if y.dim() > 2 and y.shape[-2] != 4:
+            while y.dim() > 2 and y.shape[-2] != y.shape[-1]:
+                y = y.squeeze(-2)
+        
         x_inv = torch.linalg.inv(x)
         # diff = x^-1 * y (This is a relative transform in SE(3))
         diff = torch.matmul(x_inv, y)
