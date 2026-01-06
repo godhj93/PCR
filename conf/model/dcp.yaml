@@ -5,10 +5,10 @@ args:
   pointer: transformer
   head: svd
   emb_dims: 512
-  n_blocks: 2
-  dropout: 0.1
-  ff_dims: 2048
-  n_heads: 8
+  n_blocks: 1
+  dropout: 0.0
+  ff_dims: 1024
+  n_heads: 4
   cycle: True
 
 

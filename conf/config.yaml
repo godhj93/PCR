@@ -30,6 +30,7 @@ data:
   num_workers: 8
   partial_overlap: False
   keep_ratio: 1.0
+  distance_range: 0.5
 
 loss:
   _target_: utils.loss.DCPLoss
