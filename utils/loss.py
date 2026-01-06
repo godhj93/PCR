@@ -70,12 +70,16 @@ class DCPLoss(nn.Module):
         loss = F.mse_loss(torch.matmul(rotation_ab_pred.transpose(2, 1), rotation_ab), identity) \
                + F.mse_loss(translation_ab_pred, translation_ab)
         
+        assert torch.isnan(loss).sum() == 0, "Loss is NaN!"
+        
         if self.cycle:
             rotation_loss = F.mse_loss(torch.matmul(rotation_ba_pred, rotation_ab_pred), identity)
             translation_loss = torch.mean((torch.matmul(rotation_ba_pred.transpose(2, 1),
                                                         translation_ab_pred.view(batch_size, 3, 1)).view(batch_size, 3)
                                            + translation_ba_pred) ** 2, dim=[0, 1])
             cycle_loss = rotation_loss + translation_loss
+            assert torch.isnan(cycle_loss).sum() == 0, "Cycle Loss is NaN!"
             loss = loss + self.beta * cycle_loss
+            
             
         return loss, {'loss': loss.item(), 'cycle_loss': cycle_loss.item() if self.cycle else 0.0}

@@ -197,7 +197,8 @@ class RegistrationDataset(Dataset):
             choice_idx = np.random.choice(len(cropped_points), self.num_points, replace=True)
             resampled_points = cropped_points[choice_idx]
             
-            jitter = np.random.normal(scale=1e-6, size=resampled_points.shape)
+            # 중복 샘플링된 점들을 구별하기 위한 jitter (SVD 안정성)
+            jitter = np.random.normal(scale=0.02, size=resampled_points.shape)
             resampled_points = resampled_points + jitter.astype('float32')
             
         else:
@@ -527,10 +528,10 @@ if __name__ == '__main__':
     )
     
     sample = next(iter(test_loader))
-    p = sample['p'].numpy()
-    q = sample['q'].numpy()
-    R_gt = sample['R_pq']
-    t_gt = sample['t_pq']
+    p = sample['P'].numpy()
+    q = sample['Q'].numpy()
+    R_gt = sample['R_gt']
+    t_gt = sample['t_gt']
     g_p = sample['g_p'].numpy()
     g_q = sample['g_q'].numpy()
     
