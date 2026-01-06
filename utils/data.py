@@ -348,6 +348,8 @@ def data_loader(cfg):
             unseen=cfg.data.unseen,
             factor=cfg.data.factor,
             keep_ratio=cfg.data.keep_ratio,
+            partial_overlap=cfg.data.partial_overlap,
+            distance_range=cfg.data.distance_range,
         )
         test_dataset = RegistrationDataset(
             dataset_name=dataset_name,
@@ -358,6 +360,8 @@ def data_loader(cfg):
             unseen=cfg.data.unseen,
             factor=cfg.data.factor,
             keep_ratio=cfg.data.keep_ratio,
+            partial_overlap=cfg.data.partial_overlap,
+            distance_range=cfg.data.distance_range,
         )
         
     elif dataset_name == 'bunny':
@@ -377,6 +381,8 @@ def data_loader(cfg):
             unseen=cfg.data.unseen,
             factor=cfg.data.factor,
             keep_ratio=cfg.data.keep_ratio,
+            partial_overlap=cfg.data.partial_overlap,
+            distance_range=cfg.data.distance_range,
         )
         test_dataset = RegistrationDataset(
             dataset_name=dataset_name,
@@ -387,6 +393,8 @@ def data_loader(cfg):
             unseen=cfg.data.unseen,
             factor=cfg.data.factor,
             keep_ratio=cfg.data.keep_ratio,
+            partial_overlap=cfg.data.partial_overlap,
+            distance_range=cfg.data.distance_range,
         )
     else:
         raise ValueError(f"Unsupported dataset: {dataset_name}. 'modelnet40' 또는 'bunny'여야 합니다.")
