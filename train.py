@@ -35,12 +35,19 @@ def train(cfg: DictConfig) -> None:
     # Load data and model
     train_loader, test_loader = data_loader(cfg)
     model = hydra.utils.instantiate(cfg.model).to(cfg.device)
-    log.info(f"Model Parameters: {count_parameters(model):,}")
-    optimizer = hydra.utils.instantiate(cfg.optim, params=model.parameters())
     loss_fn = hydra.utils.instantiate(cfg.loss)
+    optimizer = hydra.utils.instantiate(cfg.optim, params=model.parameters())
     
+    if isinstance(optimizer, torch.optim.SGD):
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[75, 150, 225], gamma=0.1)
+    elif isinstance(optimizer, torch.optim.AdamW):
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.training.epochs)
+    else:
+        # Keep the learning rate constant if no scheduler is specified
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=cfg.training.epochs + 1, gamma=1.0)
+    
+    log.info(f"Model Parameters: {count_parameters(model):,}")
     log.info("===== Training Start =====")
-    
     AvgMeter_train = AverageMeter()
     AvgMeter_val = AverageMeter()
     best_loss = float('inf')
@@ -53,6 +60,7 @@ def train(cfg: DictConfig) -> None:
         result = train_one_epoch(model = model, 
                         data_loader= {'train': train_loader, 'test': test_loader},
                         optimizer = optimizer,
+                        scheduler = scheduler,
                         loss_fn = loss_fn,
                         epoch = epoch,
                         metric = {'train': AvgMeter_train, 'val': AvgMeter_val},
@@ -60,7 +68,7 @@ def train(cfg: DictConfig) -> None:
         
         train_loss, val_loss = logging_tensorboard(writer, result, epoch, optimizer)
         
-        log.info(colored(f"Epoch [{epoch}/{cfg.training.epochs}] - Train Loss: {train_loss:.4f}, Test Loss: {val_loss:.4f}", "cyan"))
+        log.info(colored(f"Epoch [{epoch}/{cfg.training.epochs}] - Train Loss: {train_loss:.4f}, Test Loss: {val_loss:.4f}, LR: {optimizer.param_groups[0]['lr']:.6f}", "cyan"))
 
         # save checkpoint
         if val_loss < best_loss:

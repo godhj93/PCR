@@ -1,0 +1,14 @@
+# @package model
+_target_: utils.model.DCP
+args:
+  emb_nn: dgcnn
+  pointer: transformer
+  head: svd
+  emb_dims: 512
+  n_blocks: 2
+  dropout: 0.1
+  ff_dims: 2048
+  n_heads: 8
+  cycle: True
+
+

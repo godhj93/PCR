@@ -1,525 +1,578 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+
+import os
+import sys
+import glob
+import h5py
+import copy
+import math
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from utils.layers import VNLinearLeakyReLU, VNLinear, VNInvariant, VN_Attention, VN_Cross_Gating, VNMaxPool, NormalEstimator
-import numpy as np
+from torch.autograd import Variable
+from scipy.spatial.transform import Rotation
 
-class TimeEmbedding(nn.Module):
+def quat2mat(quat):
+    x, y, z, w = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+
+    B = quat.size(0)
+
+    w2, x2, y2, z2 = w.pow(2), x.pow(2), y.pow(2), z.pow(2)
+    wx, wy, wz = w*x, w*y, w*z
+    xy, xz, yz = x*y, x*z, y*z
+
+    rotMat = torch.stack([w2 + x2 - y2 - z2, 2*xy - 2*wz, 2*wy + 2*xz,
+                          2*wz + 2*xy, w2 - x2 + y2 - z2, 2*yz - 2*wx,
+                          2*xz - 2*wy, 2*wx + 2*yz, w2 - x2 - y2 + z2], dim=1).reshape(B, 3, 3)
+    return rotMat
+
+
+def transform_point_cloud(point_cloud, rotation, translation):
+    if len(rotation.size()) == 2:
+        rot_mat = quat2mat(rotation)
+    else:
+        rot_mat = rotation
+    return torch.matmul(rot_mat, point_cloud) + translation.unsqueeze(2)
+
+
+def npmat2euler(mats, seq='zyx'):
+    eulers = []
+    for i in range(mats.shape[0]):
+        r = Rotation.from_dcm(mats[i])
+        eulers.append(r.as_euler(seq, degrees=True))
+    return np.asarray(eulers, dtype='float32')
+
+
+# Part of the code is referred from: http://nlp.seas.harvard.edu/2018/04/03/attention.html#positional-encoding
+
+def clones(module, N):
+    return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
+
+
+def attention(query, key, value, mask=None, dropout=None):
+    d_k = query.size(-1)
+    scores = torch.matmul(query, key.transpose(-2, -1).contiguous()) / math.sqrt(d_k)
+    if mask is not None:
+        scores = scores.masked_fill(mask == 0, -1e9)
+    p_attn = F.softmax(scores, dim=-1)
+    return torch.matmul(p_attn, value), p_attn
+
+
+def nearest_neighbor(src, dst):
+    inner = -2 * torch.matmul(src.transpose(1, 0).contiguous(), dst)  # src, dst (num_dims, num_points)
+    distances = -torch.sum(src ** 2, dim=0, keepdim=True).transpose(1, 0).contiguous() - inner - torch.sum(dst ** 2,
+                                                                                                           dim=0,
+                                                                                                           keepdim=True)
+    distances, indices = distances.topk(k=1, dim=-1)
+    return distances, indices
+
+
+def knn(x, k):
+    inner = -2 * torch.matmul(x.transpose(2, 1).contiguous(), x)
+    xx = torch.sum(x ** 2, dim=1, keepdim=True)
+    pairwise_distance = -xx - inner - xx.transpose(2, 1).contiguous()
+
+    idx = pairwise_distance.topk(k=k, dim=-1)[1]  # (batch_size, num_points, k)
+    return idx
+
+
+def get_graph_feature(x, k=20):
+    # x = x.squeeze()
+    idx = knn(x, k=k)  # (batch_size, num_points, k)
+    batch_size, num_points, _ = idx.size()
+    device = torch.device('cuda')
+
+    idx_base = torch.arange(0, batch_size, device=device).view(-1, 1, 1) * num_points
+
+    idx = idx + idx_base
+
+    idx = idx.view(-1)
+
+    _, num_dims, _ = x.size()
+
+    x = x.transpose(2,
+                    1).contiguous()  # (batch_size, num_points, num_dims)  -> (batch_size*num_points, num_dims) #   batch_size * num_points * k + range(0, batch_size*num_points)
+    feature = x.view(batch_size * num_points, -1)[idx, :]
+    feature = feature.view(batch_size, num_points, k, num_dims)
+    x = x.view(batch_size, num_points, 1, num_dims).repeat(1, 1, k, 1)
+
+    feature = torch.cat((feature, x), dim=3).permute(0, 3, 1, 2)
+
+    return feature
+
+
+class EncoderDecoder(nn.Module):
     """
-    Scalar 시간 t를 고차원 벡터로 변환하여 모델이 시간 흐름에 민감하게 반응하도록 함.
-    Gaussian Fourier Projection 방식 사용.
+    A standard Encoder-Decoder architecture. Base for this and many
+    other models.
     """
-    def __init__(self, embed_dim, scale=30.):
-        super().__init__()
-        # 학습되지 않는 고정된 랜덤 주파수 (Fixed Random Frequencies)
-        self.W = nn.Parameter(torch.randn(embed_dim // 2) * scale, requires_grad=False)
-    
-    def forward(self, t):
-        # t: [B] -> [B, 1]
-        t = t.view(-1, 1) if t.dim() == 1 else t
-        # t_proj: [B, embed_dim/2]
-        t_proj = t * self.W[None, :] * 2 * np.pi
-        # output: [B, embed_dim]
-        return torch.cat([torch.sin(t_proj), torch.cos(t_proj)], dim=-1)
-    
-class PointNet_VN_Gravity_Bayes_v2(nn.Module):
-    def __init__(self, pooling='attentive', mode='equi', stride=16):
-        """
-        Args:
-            pooling: 'mean', 'max', or 'attentive' 
-            mode: 'equi' (Vector Neuron) or 'normal' (Standard PointNet)
-        """
-        super(PointNet_VN_Gravity_Bayes_v2, self).__init__()
-        
-        self.pooling = pooling
-        self.mode = mode
-        self.feat_dim = 1024
-        self.stride = stride
-        
-        # Normal Estimator
-        self.normal_estimator = NormalEstimator(k=30)
-        self.p_normals = None
-        self.q_normals = None
-        
-        # ==========================================
-        # Mode 1: Equivariant (Vector Neuron)
-        # ==========================================
-        if self.mode == 'equi':
-            vn_in_channels = 2 # (XYZ, Normal)
-            
-            # Backbone
-            self.vn_fc1 = VNLinearLeakyReLU(vn_in_channels, 64, dim=4, negative_slope=0.2)
-            self.vn_fc2 = VNLinearLeakyReLU(64, 64, dim=4, negative_slope=0.2)
-            self.vn_fc3 = VNLinearLeakyReLU(64, self.feat_dim, dim=4, negative_slope=0.2)
-            
-            # Interaction
-            self.vn_self_attn = VN_Attention(self.feat_dim)
-            self.vn_cross_gating = VN_Cross_Gating(self.feat_dim)
-            
-            if self.pooling == 'attentive':
-                raise ValueError("Attentive pooling for 'equi' mode is not implemented in this version.")
-                self.vn_invariant_layer = VNInvariant(self.feat_dim)
-                self.attention_mlp = nn.Sequential(
-                    nn.Linear(self.feat_dim * 3, 128),
-                    nn.LeakyReLU(0.2),
-                    nn.Linear(128, 1) 
-                )
-            elif self.pooling == 'max':
-                self.vn_pool = VNMaxPool(self.feat_dim)
-                
-            self.vn_invariant = VNInvariant(self.feat_dim)
-            
-            # Heads
-            self.vn_mu_head = nn.Sequential(
-                VNLinearLeakyReLU(self.feat_dim, self.feat_dim, dim=3, negative_slope=0.0),
-                VNLinear(self.feat_dim, 1)
-            )
-            self.kappa_mlp = nn.Sequential(
-                nn.Linear(self.feat_dim * 3, 128), nn.LeakyReLU(0.2),
-                nn.Linear(128, 64), nn.LeakyReLU(0.2),
-                nn.Linear(64, 1), nn.Softplus()
-            )
 
-        # ==========================================
-        # Mode 2: Normal (Standard NN)
-        # ==========================================
-        elif self.mode == 'normal':
-            std_in_channels = 9 # (XYZ + Sign-Invariant Normal Features)
-            
-            # Backbone
-            self.std_fc1 = nn.Sequential(nn.Conv1d(std_in_channels, 64, 1), nn.BatchNorm1d(64), nn.LeakyReLU(0.2))
-            self.std_fc2 = nn.Sequential(nn.Conv1d(64, 64, 1), nn.BatchNorm1d(64), nn.LeakyReLU(0.2))
-            self.std_fc3 = nn.Sequential(nn.Conv1d(64, self.feat_dim, 1), nn.BatchNorm1d(self.feat_dim), nn.LeakyReLU(0.2))
-            
-            # Interaction
-            self.std_self_attn = nn.MultiheadAttention(embed_dim=self.feat_dim, num_heads=4, batch_first=True)
-            self.std_cross_attn = nn.MultiheadAttention(embed_dim=self.feat_dim, num_heads=4, batch_first=True)
-            
-            # Attentive Pooling Components
-            if self.pooling == 'attentive':
-                self.attention_mlp = nn.Sequential(
-                    nn.Linear(self.feat_dim, 128),
-                    nn.LeakyReLU(0.2),
-                    nn.Linear(128, 1)
-                )
-            
-            # Heads
-            self.std_mu_head = nn.Sequential(
-                nn.Linear(self.feat_dim, 512), nn.LeakyReLU(0.2),
-                nn.Linear(512, 3) 
-            )
-            self.kappa_mlp = nn.Sequential(
-                nn.Linear(self.feat_dim, 128), nn.LeakyReLU(0.2),
-                nn.Linear(128, 64), nn.LeakyReLU(0.2),
-                nn.Linear(64, 1), nn.Softplus()
-            )
+    def __init__(self, encoder, decoder, src_embed, tgt_embed, generator):
+        super(EncoderDecoder, self).__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.src_embed = src_embed
+        self.tgt_embed = tgt_embed
+        self.generator = generator
 
-    def extract_feat(self, x):
-        """
-        Extract features. 
-        For 'normal' mode, converts normals to sign-invariant outer product features (9 channels).
-        """
-            
-        B, D, N = x.shape
-        
-        # 1. Normal Estimation
-        if D == 3:
-            x = self.normal_estimator(x) 
-            
-        # Capture raw normals for Hypothesis Testing
-        normals = x[:, 3:, :].contiguous() 
-        
-        # 2. Mode-specific Feature Processing
-        if self.mode == 'normal':
-            # Sign-Invariant Transformation
-            pos = x[:, :3, :] 
-            n = x[:, 3:, :]   
-            
-            # Outer Product (n * n^T) terms
-            n_xx = n[:, 0:1, :] * n[:, 0:1, :]
-            n_yy = n[:, 1:2, :] * n[:, 1:2, :]
-            n_zz = n[:, 2:3, :] * n[:, 2:3, :]
-            n_xy = n[:, 0:1, :] * n[:, 1:2, :]
-            n_xz = n[:, 0:1, :] * n[:, 2:3, :]
-            n_yz = n[:, 1:2, :] * n[:, 2:3, :]
-            
-            # Concatenate to form 9-channel input
-            x = torch.cat([pos, n_xx, n_yy, n_zz, n_xy, n_xz, n_yz], dim=1) 
-            # x = torch.cat([pos, n, n_xx, n_yy, n_zz, n_xy, n_xz, n_yz], dim=1)
-            
-            x = self.std_fc1(x)
-            x = self.std_fc2(x)
-            x = self.std_fc3(x) 
+    def forward(self, src, tgt, src_mask, tgt_mask):
+        "Take in and process masked src and target sequences."
+        return self.decode(self.encode(src, src_mask), src_mask,
+                           tgt, tgt_mask)
 
-        elif self.mode == 'equi':
-            x = x.view(B, 2, 3, N)
-            x = self.vn_fc1(x)
-            x = self.vn_fc2(x)
-            x = self.vn_fc3(x) 
-            
-        return x, normals
+    def encode(self, src, src_mask):
+        return self.encoder(self.src_embed(src), src_mask)
 
-    def process_interaction(self, f_p, f_q):
-        if self.mode == 'equi':
-            f_p = self.vn_self_attn(f_p)
-            f_q = self.vn_self_attn(f_q)
-            f_p_out = self.vn_cross_gating(x=f_p, y=f_q)
-            f_q_out = self.vn_cross_gating(x=f_q, y=f_p)
-        elif self.mode == 'normal':
-            p_in = f_p.permute(0, 2, 1); q_in = f_q.permute(0, 2, 1)
-            p_self, _ = self.std_self_attn(p_in, p_in, p_in)
-            q_self, _ = self.std_self_attn(q_in, q_in, q_in)
-            p_in = p_in + p_self; q_in = q_in + q_self
-            p_cross, _ = self.std_cross_attn(query=p_in, key=q_in, value=q_in)
-            q_cross, _ = self.std_cross_attn(query=q_in, key=p_in, value=p_in)
-            p_out = p_in + p_cross; q_out = q_in + q_cross
-            f_p_out = p_out.permute(0, 2, 1); f_q_out = q_out.permute(0, 2, 1)
-        return f_p_out, f_q_out
+    def decode(self, memory, src_mask, tgt, tgt_mask):
+        return self.generator(self.decoder(self.tgt_embed(tgt), memory, src_mask, tgt_mask))
 
-    def apply_pooling(self, feat):
-        
-        if self.pooling == 'attentive':
-            if self.mode == 'equi':
-                # feat: [B, C, 3, N]
-                inv_feat = self.vn_invariant_layer(feat) # [B, C*3, N]
-                scores = self.attention_mlp(inv_feat.permute(0, 2, 1)) # [B, N, 1]
-                weights = F.softmax(scores, dim=1) 
-                
-                # Weighted Sum (Broadcasting)
-                weights = weights.permute(0, 2, 1).unsqueeze(1) # (B, 1, 1, N)
-                global_feat = torch.sum(feat * weights, dim=-1) # (B, C, 3)
-                
-            elif self.mode == 'normal':
-                # feat: [B, C, N]
-                scores = self.attention_mlp(feat.permute(0, 2, 1)) # [B, N, 1]
-                weights = F.softmax(scores, dim=1) # (B, N, 1)
-                
-                weights = weights.permute(0, 2, 1) # (B, 1, N)
-                global_feat = torch.sum(feat * weights, dim=-1) # (B, C)
-            return global_feat
-            
-        elif self.pooling == 'mean':
-            return torch.mean(feat, dim=-1)
-        elif self.pooling == 'max':
-             if self.mode == 'equi': return self.vn_pool(feat)
-             else: return torch.max(feat, dim=-1)[0]
 
-    def forward_head(self, g_feat):
-        if self.mode == 'equi':
-            mu = self.vn_mu_head(g_feat).mean(dim=1)
-            mu = F.normalize(mu, p=2, dim=1)
-            g_inv = self.vn_invariant(g_feat)
-            kappa = self.kappa_mlp(g_inv) + 1.0
-        elif self.mode == 'normal':
-            mu = self.std_mu_head(g_feat)
-            mu = F.normalize(mu, p=2, dim=1)
-            kappa = self.kappa_mlp(g_feat) + 1.0
-        return mu, kappa
+class Generator(nn.Module):
+    def __init__(self, emb_dims):
+        super(Generator, self).__init__()
+        self.nn = nn.Sequential(nn.Linear(emb_dims, emb_dims // 2),
+                                nn.BatchNorm1d(emb_dims // 2),
+                                nn.ReLU(),
+                                nn.Linear(emb_dims // 2, emb_dims // 4),
+                                nn.BatchNorm1d(emb_dims // 4),
+                                nn.ReLU(),
+                                nn.Linear(emb_dims // 4, emb_dims // 8),
+                                nn.BatchNorm1d(emb_dims // 8),
+                                nn.ReLU())
+        self.proj_rot = nn.Linear(emb_dims // 8, 4)
+        self.proj_trans = nn.Linear(emb_dims // 8, 3)
 
-    def forward(self, p, q, return_feat=False):
-        # 1. Backbone (includes Sign-Invariant input for normal mode)
-        f_p, n_p = self.extract_feat(p) 
-        f_q, n_q = self.extract_feat(q)
-        
-        self.p_normals = n_p
-        self.q_normals = n_q
-        
-        # 2. Downsampling
-        stride = self.stride 
-        if self.mode == 'equi':
-            f_p_small = f_p[:, :, :, ::stride]
-            f_q_small = f_q[:, :, :, ::stride]
+    def forward(self, x):
+        x = self.nn(x.max(dim=1)[0])
+        rotation = self.proj_rot(x)
+        translation = self.proj_trans(x)
+        rotation = rotation / torch.norm(rotation, p=2, dim=1, keepdim=True)
+        return rotation, translation
+
+
+class Encoder(nn.Module):
+    def __init__(self, layer, N):
+        super(Encoder, self).__init__()
+        self.layers = clones(layer, N)
+        self.norm = LayerNorm(layer.size)
+
+    def forward(self, x, mask):
+        for layer in self.layers:
+            x = layer(x, mask)
+        return self.norm(x)
+
+
+class Decoder(nn.Module):
+    "Generic N layer decoder with masking."
+
+    def __init__(self, layer, N):
+        super(Decoder, self).__init__()
+        self.layers = clones(layer, N)
+        self.norm = LayerNorm(layer.size)
+
+    def forward(self, x, memory, src_mask, tgt_mask):
+        for layer in self.layers:
+            x = layer(x, memory, src_mask, tgt_mask)
+        return self.norm(x)
+
+
+class LayerNorm(nn.Module):
+    def __init__(self, features, eps=1e-6):
+        super(LayerNorm, self).__init__()
+        self.a_2 = nn.Parameter(torch.ones(features))
+        self.b_2 = nn.Parameter(torch.zeros(features))
+        self.eps = eps
+
+    def forward(self, x):
+        mean = x.mean(-1, keepdim=True)
+        std = x.std(-1, keepdim=True)
+        return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
+
+
+class SublayerConnection(nn.Module):
+    def __init__(self, size, dropout=None):
+        super(SublayerConnection, self).__init__()
+        self.norm = LayerNorm(size)
+
+    def forward(self, x, sublayer):
+        return x + sublayer(self.norm(x))
+
+
+class EncoderLayer(nn.Module):
+    def __init__(self, size, self_attn, feed_forward, dropout):
+        super(EncoderLayer, self).__init__()
+        self.self_attn = self_attn
+        self.feed_forward = feed_forward
+        self.sublayer = clones(SublayerConnection(size, dropout), 2)
+        self.size = size
+
+    def forward(self, x, mask):
+        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, mask))
+        return self.sublayer[1](x, self.feed_forward)
+
+
+class DecoderLayer(nn.Module):
+    "Decoder is made of self-attn, src-attn, and feed forward (defined below)"
+
+    def __init__(self, size, self_attn, src_attn, feed_forward, dropout):
+        super(DecoderLayer, self).__init__()
+        self.size = size
+        self.self_attn = self_attn
+        self.src_attn = src_attn
+        self.feed_forward = feed_forward
+        self.sublayer = clones(SublayerConnection(size, dropout), 3)
+
+    def forward(self, x, memory, src_mask, tgt_mask):
+        "Follow Figure 1 (right) for connections."
+        m = memory
+        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, tgt_mask))
+        x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, src_mask))
+        return self.sublayer[2](x, self.feed_forward)
+
+
+class MultiHeadedAttention(nn.Module):
+    def __init__(self, h, d_model, dropout=0.1):
+        "Take in model size and number of heads."
+        super(MultiHeadedAttention, self).__init__()
+        assert d_model % h == 0
+        # We assume d_v always equals d_k
+        self.d_k = d_model // h
+        self.h = h
+        self.linears = clones(nn.Linear(d_model, d_model), 4)
+        self.attn = None
+        self.dropout = None
+
+    def forward(self, query, key, value, mask=None):
+        "Implements Figure 2"
+        if mask is not None:
+            # Same mask applied to all h heads.
+            mask = mask.unsqueeze(1)
+        nbatches = query.size(0)
+
+        # 1) Do all the linear projections in batch from d_model => h x d_k
+        query, key, value = \
+            [l(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2).contiguous()
+             for l, x in zip(self.linears, (query, key, value))]
+
+        # 2) Apply attention on all the projected vectors in batch.
+        x, self.attn = attention(query, key, value, mask=mask,
+                                 dropout=self.dropout)
+
+        # 3) "Concat" using a view and apply a final linear.
+        x = x.transpose(1, 2).contiguous() \
+            .view(nbatches, -1, self.h * self.d_k)
+        return self.linears[-1](x)
+
+
+class PositionwiseFeedForward(nn.Module):
+    "Implements FFN equation."
+
+    def __init__(self, d_model, d_ff, dropout=0.1):
+        super(PositionwiseFeedForward, self).__init__()
+        self.w_1 = nn.Linear(d_model, d_ff)
+        self.norm = nn.Sequential()  # nn.BatchNorm1d(d_ff)
+        self.w_2 = nn.Linear(d_ff, d_model)
+        self.dropout = None
+
+    def forward(self, x):
+        return self.w_2(self.norm(F.relu(self.w_1(x)).transpose(2, 1).contiguous()).transpose(2, 1).contiguous())
+
+
+class PointNet(nn.Module):
+    def __init__(self, emb_dims=512):
+        super(PointNet, self).__init__()
+        self.conv1 = nn.Conv1d(3, 64, kernel_size=1, bias=False)
+        self.conv2 = nn.Conv1d(64, 64, kernel_size=1, bias=False)
+        self.conv3 = nn.Conv1d(64, 64, kernel_size=1, bias=False)
+        self.conv4 = nn.Conv1d(64, 128, kernel_size=1, bias=False)
+        self.conv5 = nn.Conv1d(128, emb_dims, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm1d(64)
+        self.bn2 = nn.BatchNorm1d(64)
+        self.bn3 = nn.BatchNorm1d(64)
+        self.bn4 = nn.BatchNorm1d(128)
+        self.bn5 = nn.BatchNorm1d(emb_dims)
+
+    def forward(self, x):
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = F.relu(self.bn3(self.conv3(x)))
+        x = F.relu(self.bn4(self.conv4(x)))
+        x = F.relu(self.bn5(self.conv5(x)))
+        return x
+
+
+class DGCNN(nn.Module):
+    def __init__(self, emb_dims=512):
+        super(DGCNN, self).__init__()
+        self.conv1 = nn.Conv2d(6, 64, kernel_size=1, bias=False)
+        self.conv2 = nn.Conv2d(64, 64, kernel_size=1, bias=False)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=1, bias=False)
+        self.conv4 = nn.Conv2d(128, 256, kernel_size=1, bias=False)
+        self.conv5 = nn.Conv2d(512, emb_dims, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.bn3 = nn.BatchNorm2d(128)
+        self.bn4 = nn.BatchNorm2d(256)
+        self.bn5 = nn.BatchNorm2d(emb_dims)
+
+    def forward(self, x):
+        batch_size, num_dims, num_points = x.size()
+        x = get_graph_feature(x)
+        x = F.relu(self.bn1(self.conv1(x)))
+        x1 = x.max(dim=-1, keepdim=True)[0]
+
+        x = F.relu(self.bn2(self.conv2(x)))
+        x2 = x.max(dim=-1, keepdim=True)[0]
+
+        x = F.relu(self.bn3(self.conv3(x)))
+        x3 = x.max(dim=-1, keepdim=True)[0]
+
+        x = F.relu(self.bn4(self.conv4(x)))
+        x4 = x.max(dim=-1, keepdim=True)[0]
+
+        x = torch.cat((x1, x2, x3, x4), dim=1)
+
+        x = F.relu(self.bn5(self.conv5(x))).view(batch_size, -1, num_points)
+        return x
+
+
+class MLPHead(nn.Module):
+    def __init__(self, args):
+        super(MLPHead, self).__init__()
+        emb_dims = args.emb_dims
+        self.emb_dims = emb_dims
+        self.nn = nn.Sequential(nn.Linear(emb_dims * 2, emb_dims // 2),
+                                nn.BatchNorm1d(emb_dims // 2),
+                                nn.ReLU(),
+                                nn.Linear(emb_dims // 2, emb_dims // 4),
+                                nn.BatchNorm1d(emb_dims // 4),
+                                nn.ReLU(),
+                                nn.Linear(emb_dims // 4, emb_dims // 8),
+                                nn.BatchNorm1d(emb_dims // 8),
+                                nn.ReLU())
+        self.proj_rot = nn.Linear(emb_dims // 8, 4)
+        self.proj_trans = nn.Linear(emb_dims // 8, 3)
+
+    def forward(self, *input):
+        src_embedding = input[0]
+        tgt_embedding = input[1]
+        embedding = torch.cat((src_embedding, tgt_embedding), dim=1)
+        embedding = self.nn(embedding.max(dim=-1)[0])
+        rotation = self.proj_rot(embedding)
+        rotation = rotation / torch.norm(rotation, p=2, dim=1, keepdim=True)
+        translation = self.proj_trans(embedding)
+        return quat2mat(rotation), translation
+
+
+class Identity(nn.Module):
+    def __init__(self):
+        super(Identity, self).__init__()
+
+    def forward(self, *input):
+        return input
+
+
+class Transformer(nn.Module):
+    def __init__(self, args):
+        super(Transformer, self).__init__()
+        self.emb_dims = args.emb_dims
+        self.N = args.n_blocks
+        self.dropout = args.dropout
+        self.ff_dims = args.ff_dims
+        self.n_heads = args.n_heads
+        c = copy.deepcopy
+        attn = MultiHeadedAttention(self.n_heads, self.emb_dims)
+        ff = PositionwiseFeedForward(self.emb_dims, self.ff_dims, self.dropout)
+        self.model = EncoderDecoder(Encoder(EncoderLayer(self.emb_dims, c(attn), c(ff), self.dropout), self.N),
+                                    Decoder(DecoderLayer(self.emb_dims, c(attn), c(attn), c(ff), self.dropout), self.N),
+                                    nn.Sequential(),
+                                    nn.Sequential(),
+                                    nn.Sequential())
+
+    def forward(self, *input):
+        src = input[0]
+        tgt = input[1]
+        src = src.transpose(2, 1).contiguous()
+        tgt = tgt.transpose(2, 1).contiguous()
+        tgt_embedding = self.model(src, tgt, None, None).transpose(2, 1).contiguous()
+        src_embedding = self.model(tgt, src, None, None).transpose(2, 1).contiguous()
+        return src_embedding, tgt_embedding
+
+
+class SVDHead(nn.Module):
+    def __init__(self, args):
+        super(SVDHead, self).__init__()
+        self.emb_dims = args.emb_dims
+        self.reflect = nn.Parameter(torch.eye(3), requires_grad=False)
+        self.reflect[2, 2] = -1
+
+    def forward(self, *input):
+        src_embedding = input[0]
+        tgt_embedding = input[1]
+        src = input[2]
+        tgt = input[3]
+        batch_size = src.size(0)
+
+        d_k = src_embedding.size(1)
+        scores = torch.matmul(src_embedding.transpose(2, 1).contiguous(), tgt_embedding) / math.sqrt(d_k)
+        scores = torch.softmax(scores, dim=2)
+
+        src_corr = torch.matmul(tgt, scores.transpose(2, 1).contiguous())
+
+        src_centered = src - src.mean(dim=2, keepdim=True)
+
+        src_corr_centered = src_corr - src_corr.mean(dim=2, keepdim=True)
+
+        H = torch.matmul(src_centered, src_corr_centered.transpose(2, 1).contiguous())
+
+        U, S, V = [], [], []
+        R = []
+
+        for i in range(src.size(0)):
+            u, s, v = torch.svd(H[i])
+            r = torch.matmul(v, u.transpose(1, 0).contiguous())
+            r_det = torch.det(r)
+            if r_det < 0:
+                u, s, v = torch.svd(H[i])
+                v = torch.matmul(v, self.reflect)
+                r = torch.matmul(v, u.transpose(1, 0).contiguous())
+                # r = r * self.reflect
+            R.append(r)
+
+            U.append(u)
+            S.append(s)
+            V.append(v)
+
+        U = torch.stack(U, dim=0)
+        V = torch.stack(V, dim=0)
+        S = torch.stack(S, dim=0)
+        R = torch.stack(R, dim=0)
+
+        t = torch.matmul(-R, src.mean(dim=2, keepdim=True)) + src_corr.mean(dim=2, keepdim=True)
+        return R, t.view(batch_size, 3)
+
+class DCP(nn.Module):
+    def __init__(self, args):
+        super(DCP, self).__init__()
+        self.emb_dims = args.emb_dims
+        self.cycle = args.cycle
+        if args.emb_nn == 'pointnet':
+            self.emb_nn = PointNet(emb_dims=self.emb_dims)
+        elif args.emb_nn == 'dgcnn':
+            self.emb_nn = DGCNN(emb_dims=self.emb_dims)
         else:
-            f_p_small = f_p[:, :, ::stride]
-            f_q_small = f_q[:, :, ::stride]
-        
-        # 3. Interaction
-        f_p_gated, f_q_gated = self.process_interaction(f_p_small, f_q_small)
-        
-        # 4. Pooling
-        g_p = self.apply_pooling(f_p_gated)
-        g_q = self.apply_pooling(f_q_gated)
-            
-        # 5. Head
-        mu_p, kappa_p = self.forward_head(g_p)
-        mu_q, kappa_q = self.forward_head(g_q)
-        
-        if return_feat:
-            return g_p, g_q, mu_p, mu_q, kappa_p, kappa_q
-        return (mu_p, kappa_p), (mu_q, kappa_q)
-        
-    def check_correspondence_validity(self, batch_idx, P_indices, Q_indices, g_p, kappa_p, g_q, kappa_q, chi2_thresh=9.0):
-        """
-        Analytic Covariance Hypothesis Testing with Robustness Floor
-        """
-        if self.p_normals is None or self.q_normals is None:
-            return np.ones(len(P_indices), dtype=bool), np.zeros(len(P_indices))
+            raise Exception('Not implemented')
 
-        # 1. Retrieve Stored Normals
-        curr_p_normals = self.p_normals[batch_idx].transpose(0, 1) 
-        curr_q_normals = self.q_normals[batch_idx].transpose(0, 1) 
-        
-        dev = curr_p_normals.device
-        if not isinstance(P_indices, torch.Tensor): P_indices = torch.tensor(P_indices, device=dev)
-        if not isinstance(Q_indices, torch.Tensor): Q_indices = torch.tensor(Q_indices, device=dev)
-        
-        n_p = curr_p_normals[P_indices] 
-        n_q = curr_q_normals[Q_indices] 
-        
-        # 2. Inclination & Geometric Sensitivity
-        I_p = torch.matmul(n_p, g_p)
-        I_q = torch.matmul(n_q, g_q)
-        
-        # sin^2 term (Geometric Sensitivity) using Absolute Inclination for Sign Robustness
-        # Note: sin^2(x) = 1 - cos^2(x). Effect is same for +I or -I.
-        sin2_p = torch.clamp(1.0 - I_p**2, min=1e-6)
-        sin2_q = torch.clamp(1.0 - I_q**2, min=1e-6)
-        
-        # 3. Geometric Covariance & Variance
-        # Additive Noise Floor (Critical for BNN robustness)
-        base_variance = 0.01 
-        
-        term_p = sin2_p / (kappa_p + 1e-6)
-        term_q = sin2_q / (kappa_q + 1e-6)
-        
-        # Simplified joint variance (assuming independence for robustness against sign flips)
-        sigma_sq_total = term_p + term_q + base_variance
-        
-        # 4. Test Statistic (Absolute Difference)
-        # [KEY FIX] Compare Absolute Values to ignore Sign Ambiguity of Raw Normals
-        diff = torch.abs(I_p) - torch.abs(I_q)
-        residual_sq = diff**2
-        
-        M2_score = residual_sq / sigma_sq_total
-        
-        valid_mask = M2_score < chi2_thresh
-        
-        return valid_mask.cpu().numpy(), M2_score.cpu().numpy()
-    
-class PhysicsAttention(nn.Module):
-    def __init__(self, dim, num_heads=4):
-        super().__init__()
-        self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, batch_first=True)
-        self.norm = nn.LayerNorm(dim)
-        
-    def forward(self, query, key_value):
-        # query: [B, 1, D] (Physics)
-        # key_value: [B, 2, D] (Geometry [P, Q])
-        
-        # Q가 K, V를 참조하여 필요한 정보를 추출
-        attn_out, _ = self.attn(query, key_value, key_value)
-        return self.norm(query + attn_out) # Residual Connection
-
-class GravityVelocityDecoder(nn.Module):
-    def __init__(self, feat_dim, time_embed_dim=64, hidden_dim=512, encoder_mode='equi'):
-        super().__init__()
-        self.encoder_mode = encoder_mode
-        self.hidden_dim = hidden_dim
-        
-        # 1. Time Embedding
-        self.time_embed = TimeEmbedding(time_embed_dim)
-        
-        # 2. Feature Adapter
-        if self.encoder_mode == 'equi':
-            input_feat_dim = feat_dim * 3
+        if args.pointer == 'identity':
+            self.pointer = Identity()
+        elif args.pointer == 'transformer':
+            self.pointer = Transformer(args=args)
         else:
-            input_feat_dim = feat_dim
-            
-        self.geom_proj = nn.Sequential(
-            nn.Linear(input_feat_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU()
-        )
-        
-        # 3. Physics Adapter (수정됨!)
-        # 기존: Mu(3*2) + Kappa(1*2) + Time
-        # 변경: Sampled_G(3*2) + Time
-        # Kappa는 더 이상 입력으로 받지 않음 (노이즈로 녹아들어감)
-        physics_dim = (3 * 2) + time_embed_dim 
-        
-        self.physics_proj = nn.Sequential(
-            nn.Linear(physics_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU()
-        )
-        
-        # 4. Cross Attention
-        self.cross_attn = PhysicsAttention(hidden_dim, num_heads=8)
-        
-        # 5. Velocity Head
-        self.head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, 6)
-        )
-        
-        # Zero Init (안정적인 학습 시작을 위해 추천)
-        nn.init.uniform_(self.head[-1].weight, -1e-5, 1e-5)
-        nn.init.constant_(self.head[-1].bias, 0)
+            raise Exception("Not implemented")
 
-    def forward(self, g_p, g_q, g_sample_p, g_sample_q, t):
-        # 인자 변경: mu_p, kappa_p -> g_sample_p (샘플링된 중력)
-        
-        B = g_p.shape[0]
-        
-        # --- [Step 1] Prepare Geometry ---
-        flat_p = g_p.reshape(B, -1)
-        flat_q = g_q.reshape(B, -1)
-        h_p = self.geom_proj(flat_p)
-        h_q = self.geom_proj(flat_q)
-        geom_kv = torch.stack([h_p, h_q], dim=1)
-        
-        # --- [Step 2] Prepare Physics (수정됨!) ---
-        t_emb = self.time_embed(t)
-        
-        # Mu, Kappa 대신 샘플링된 벡터를 사용
-        # g_sample: [B, 3] (노이즈가 섞인 중력)
-        phys_raw = torch.cat([g_sample_p, g_sample_q, t_emb], dim=1) 
-        
-        phys_q = self.physics_proj(phys_raw).unsqueeze(1)
-        
-        # --- [Step 3] Cross Attention ---
-        fused_feat = self.cross_attn(query=phys_q, key_value=geom_kv)
-        fused_feat = fused_feat.squeeze(1)
-        
-        # --- [Step 4] Predict ---
-        v_pred = self.head(fused_feat)
-        
-        return v_pred
-
-class GravityFlowAgent(nn.Module):
-    def __init__(self, pooling='attentive', mode='normal', stride=4):
-        super().__init__()
-        self.encoder = PointNet_VN_Gravity_Bayes_v2(pooling=pooling, mode=mode, stride=stride)
-        self.decoder = GravityVelocityDecoder(
-            feat_dim=self.encoder.feat_dim,
-            encoder_mode=self.encoder.mode
-        )
-
-    def reparameterize(self, mu, kappa):
-        """
-        vMF Reparameterization Trick (Gaussian Approximation)
-        input: mu (B, 3), kappa (B, 1)
-        output: sampled_vector (B, 3)
-        """
-        # Training 모드일 때만 노이즈 주입
-        if self.training:
-            # 1. Generate Noise epsilon ~ N(0, I)
-            eps = torch.randn_like(mu)
-            
-            # 2. Scale Noise by Uncertainty (1/sqrt(kappa))
-            # kappa가 작으면(불확실하면) 노이즈가 커짐 -> Decoder가 고통받음 -> kappa를 키우게 됨
-            # kappa에 1e-6을 더해 0으로 나누는 것 방지
-            scaled_noise = eps / torch.sqrt(kappa + 1e-6)
-            
-            # 3. Add to Mean
-            # 접평면 투영 등 복잡한 것보다, 단순히 더하고 정규화하는 게 학습엔 더 효과적임
-            z = mu + scaled_noise
-            
-            # 4. Normalize to unit sphere
-            return F.normalize(z, p=2, dim=1)
+        if args.head == 'mlp':
+            self.head = MLPHead(args=args)
+        elif args.head == 'svd':
+            self.head = SVDHead(args=args)
         else:
-            # Test/Validation 시에는 노이즈 없이 평균값(mu) 사용
-            return mu
+            raise Exception('Not implemented')
 
-    def forward(self, x, t, context_q):
-        # 1. 상태 인지 (Perception)
-        # Encoder는 기존과 동일하게 mu, kappa를 뱉음
-        feat_p, feat_q, mu_p, mu_q, kappa_p, kappa_q = self.encoder(x, context_q, return_feat=True)
-        
-        # 2. 샘플링 (핵심!)
-        # 여기서 미분 가능한 샘플링 수행
-        g_sample_p = self.reparameterize(mu_p, kappa_p)
-        g_sample_q = self.reparameterize(mu_q, kappa_q)
-        
-        # 3. 행동 결정 (Action)
-        # Decoder에게는 파라미터 대신 '샘플'을 줌
-        v_pred = self.decoder(
-            g_p=feat_p, g_q=feat_q,
-            g_sample_p=g_sample_p, g_sample_q=g_sample_q, # 변경된 입력
-            t=t
-        )
-        
-        # 반환값은 그대로 유지 (Loss 계산에는 원본 mu, kappa가 필요하므로)
-        return v_pred, (mu_p, kappa_p), (mu_q, kappa_q)
+    def forward(self, *input):
+        src = input[0]
+        tgt = input[1]
+        src_embedding = self.emb_nn(src)
+        tgt_embedding = self.emb_nn(tgt)
+
+        src_embedding_p, tgt_embedding_p = self.pointer(src_embedding, tgt_embedding)
+
+        src_embedding = src_embedding + src_embedding_p
+        tgt_embedding = tgt_embedding + tgt_embedding_p
+
+        rotation_ab, translation_ab = self.head(src_embedding, tgt_embedding, src, tgt)
+        if self.cycle:
+            rotation_ba, translation_ba = self.head(tgt_embedding, src_embedding, tgt, src)
+
+        else:
+            rotation_ba = rotation_ab.transpose(2, 1).contiguous()
+            translation_ba = -torch.matmul(rotation_ba, translation_ab.unsqueeze(2)).squeeze(2)
+        return rotation_ab, translation_ab, rotation_ba, translation_ba
     
 if __name__ == '__main__':
-    print("=== Model & Loss Test Start ===\n")
-
-    # 1. Encoder 및 Agent 인스턴스 생성
-    # (PointNet_VN_Gravity_Bayes_v2, GravityVelocityDecoder는 이미 정의되어 있다고 가정)
-    encoder = PointNet_VN_Gravity_Bayes_v2(mode='normal', pooling='attentive', stride=4)
-    agent = GravityFlowAgent(encoder)
     
-    from utils.loss import VMFLoss
-    # Loss 함수 인스턴스
-    vmf_loss_fn = VMFLoss()
+    import argparse
+    from utils.data import data_loader
+    from omegaconf import OmegaConf
+    from utils.common import count_parameters
+    from utils.loss import DCPLoss
     
-    # 파라미터 개수 확인
-    total_params = sum(p.numel() for p in agent.parameters() if p.requires_grad)
-    print(f"Total Trainable Parameters: {total_params:,}")
-
-    # 2. Dummy Inputs 생성
-    B, N = 4, 1024
-    P_t = torch.randn(B, 3, N) # 변형된 Source Point Cloud
-    Q = torch.randn(B, 3, N)   # Target Point Cloud
-    t = torch.rand(B)          # Random Time [0, 1]
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset', type=str, default='bunny', choices=['modelnet40', 'bunny'])
+    parser.add_argument('--bunny_path', type=str, default='data/bunny/reconstruction/bun_zipper.ply')
+    parser.add_argument('--method', type=str, default='p2p', choices=['p2p', 'p2l', 'l2l'],
+                        help='ICP method: p2p (point-to-point), p2l (point-to-plane), l2l (plane-to-plane)')
+    parser.add_argument('--max_iter', type=int, default=50, help='Maximum ICP iterations')
+    parser.add_argument('--tol', type=float, default=1e-6, help='Convergence tolerance')
+    parser.add_argument('--dist_thresh', type=float, default=0.1, help='Distance threshold for matching')
+    parser.add_argument('--emb_dims', type=int, default=512, help='Dimension of point feature embeddings')
+    parser.add_argument('--n_blocks', type=int, default=1, help='Number of Transformer blocks')
+    parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate')
+    parser.add_argument('--ff_dims', type=int, default=1024, help='Dimension of feedforward network in Transformer')
+    parser.add_argument('--n_heads', type=int, default=8, help='Number of attention heads in Transformer')
+    parser.add_argument('--emb_nn', type=str, default='dgcnn', choices=['pointnet', 'dgcnn'],
+                        help='Point cloud embedding network')
+    parser.add_argument('--pointer', type=str, default='transformer', choices=['identity', 'transformer'],
+                        help='Pointer network')
+    parser.add_argument('--head', type=str, default='svd', choices=['mlp', 'svd'], help='Transformation head')
+    parser.add_argument('--cycle', action='store_true', help='Use cycle consistency')
+    args = parser.parse_args()
     
-    # 3. Dummy Targets (Ground Truth) 생성
-    # Flow Matching 정답 속도 (Linear 3 + Angular 3)
-    u_gt = torch.randn(B, 6)
+    # Model Forward Test
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    loss_fn = DCPLoss().to(device)
     
-    # Gravity 정답 벡터 (단위 벡터여야 함)
-    g_gt_p = F.normalize(torch.randn(B, 3), p=2, dim=1) # P_t 시점의 정답 중력
-    g_gt_q = F.normalize(torch.randn(B, 3), p=2, dim=1) # Q 시점의 정답 중력
-
-    # 4. Forward Pass
-    print("\n[Step 1] Forward Pass...")
-    # 수정된 Agent는 3가지 튜플을 반환함
-    v_pred, (mu_p, kappa_p), (mu_q, kappa_q) = agent(P_t, t, Q)
+    train_loader, test_loader = data_loader(
+        OmegaConf.create({
+            'data': {
+                'name': 'bunny',
+                'bunny_path': args.bunny_path,
+                'num_points': 1024,
+                'gaussian_noise': True,
+                'unseen': False,
+                'factor': 1,
+                'keep_ratio': 1.0,
+                'num_workers': 0
+            },
+            'training': {
+                'batch_size': 1
+            }
+        })
+    )
     
-    print(f"  - Velocity Shape : {v_pred.shape}")   # [4, 6]
-    print(f"  - Mu P Shape     : {mu_p.shape}")     # [4, 3]
-    print(f"  - Kappa P Shape  : {kappa_p.shape}")  # [4, 1]
+    sample = next(iter(train_loader))
+    model = DCP(args=args).to(device)
+    print(f"Model has {count_parameters(model):,} trainable parameters")
     
-    # 5. Loss Calculation
-    print("\n[Step 2] Computing Losses...")
+    p = sample['p'].to(device)  # (B, 3, N)
+    q = sample['q'].to(device)  # (B, 3, N)
     
-    # (A) Flow Loss (MSE)
-    loss_flow = F.mse_loss(v_pred, u_gt)
-    print(f"  - Flow Loss      : {loss_flow.item():.4f}")
+    rotation_ab, translation_ab, rotation_ba, translation_ba = model(p, q)
     
-    # (B) Gravity Loss (VMFLoss for P and Q)
-    loss_g_p = vmf_loss_fn(mu_p, kappa_p, g_gt_p)
-    loss_g_q = vmf_loss_fn(mu_q, kappa_q, g_gt_q)
-    loss_gravity = (loss_g_p + loss_g_q) * 0.5
-    print(f"  - Gravity Loss P : {loss_g_p.item():.4f}")
-    print(f"  - Gravity Loss Q : {loss_g_q.item():.4f}")
+    loss = loss_fn(
+        rotation_ab_pred = rotation_ab,
+        translation_ab_pred = translation_ab.unsqueeze(2),
+        rotation_ab = sample['R_pq'].to(device),
+        translation_ab = sample['t_pq'].to(device).unsqueeze(2)
+    )
+    print("Rotation AB:", rotation_ab.size())
+    print("Translation AB:", translation_ab.size())
+    print("Rotation BA:", rotation_ba.size())
+    print("Translation BA:", translation_ba.size())
+    print("Loss:", loss.item())
     
-    # (C) Total Loss
-    beta = 1.0
-    total_loss = loss_flow + beta * loss_gravity
-    print(f"  - Total Loss     : {total_loss.item():.4f}")
-
-    # 6. Backward Pass (Gradient Check)
-    print("\n[Step 3] Backward Pass...")
+    # Backward test
+    loss.backward()
+    print("Backward pass successful!")
     
-    # Backward 실행
-    try:
-        total_loss.backward()
-        print("  - Backward execution successful!")
-        
-        # [수정] net[0] 대신 head[0] 또는 geom_proj[0]의 gradient를 확인
-        # agent.decoder.head[0]은 Velocity Head의 첫 번째 Linear Layer입니다.
-        grad_norm = agent.decoder.head[0].weight.grad.norm()
-        
-        print(f"  - Gradient Norm at Decoder Head Layer 0: {grad_norm.item():.4f}")
-        
-        if grad_norm > 0:
-            print("  => SUCCESS: Gradients are flowing correctly.")
-        else:
-            print("  => WARNING: Gradient is zero.")
-            
-    except RuntimeError as e:
-        print(f"  => FAILURE: Backward pass failed with error: {e}")
