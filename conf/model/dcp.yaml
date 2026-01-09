@@ -1,7 +1,7 @@
 # @package model
 _target_: utils.model.DCP
 args:
-  emb_nn: dgcnn
+  emb_nn: pointnet
   pointer: transformer
   head: svd
   emb_dims: 512
@@ -9,6 +9,7 @@ args:
   dropout: 0.0
   ff_dims: 1024
   n_heads: 4
-  cycle: True
+  cycle: True,
+  gravity: True
 
 

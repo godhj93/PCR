@@ -14,6 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
 from scipy.spatial.transform import Rotation
+from utils.layers import NormalEstimator
 
 def quat2mat(quat):
     x, y, z, w = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
@@ -83,7 +84,7 @@ def get_graph_feature(x, k=20):
     # x = x.squeeze()
     idx = knn(x, k=k)  # (batch_size, num_points, k)
     batch_size, num_points, _ = idx.size()
-    device = torch.device('cuda')
+    device = x.device  # Use the same device as input tensor
 
     idx_base = torch.arange(0, batch_size, device=device).view(-1, 1, 1) * num_points
 
@@ -282,9 +283,14 @@ class PositionwiseFeedForward(nn.Module):
 
 
 class PointNet(nn.Module):
-    def __init__(self, emb_dims=512):
+    def __init__(self, emb_dims=512, normal=True):
         super(PointNet, self).__init__()
-        self.conv1 = nn.Conv1d(3, 64, kernel_size=1, bias=False)
+        if normal:
+            self.normal_estimator = NormalEstimator()
+            self.conv1 = nn.Conv1d(6, 64, kernel_size=1, bias=False)
+        else:
+            self.normal_estimator = None
+            self.conv1 = nn.Conv1d(3, 64, kernel_size=1, bias=False)
         self.conv2 = nn.Conv1d(64, 64, kernel_size=1, bias=False)
         self.conv3 = nn.Conv1d(64, 64, kernel_size=1, bias=False)
         self.conv4 = nn.Conv1d(64, 128, kernel_size=1, bias=False)
@@ -296,18 +302,24 @@ class PointNet(nn.Module):
         self.bn5 = nn.BatchNorm1d(emb_dims)
 
     def forward(self, x):
+        normals = None
+        if self.normal_estimator is not None:
+            x = self.normal_estimator(x)
+            normals = x[:, 3:, :]
+            
         x = F.relu(self.bn1(self.conv1(x)))
         x = F.relu(self.bn2(self.conv2(x)))
         x = F.relu(self.bn3(self.conv3(x)))
         x = F.relu(self.bn4(self.conv4(x)))
         x = F.relu(self.bn5(self.conv5(x)))
-        return x
+        
+        return x, normals
 
 
 class DGCNN(nn.Module):
     def __init__(self, emb_dims=512):
         super(DGCNN, self).__init__()
-        self.conv1 = nn.Conv2d(6, 64, kernel_size=1, bias=False)
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=1, bias=False)
         self.conv2 = nn.Conv2d(64, 64, kernel_size=1, bias=False)
         self.conv3 = nn.Conv2d(64, 128, kernel_size=1, bias=False)
         self.conv4 = nn.Conv2d(128, 256, kernel_size=1, bias=False)
@@ -446,26 +458,248 @@ class SVDHead(nn.Module):
             S.append(s)
             V.append(v)
 
-        U = torch.stack(U, dim=0)
-        V = torch.stack(V, dim=0)
-        S = torch.stack(S, dim=0)
+        self.U = torch.stack(U, dim=0)
+        self.V = torch.stack(V, dim=0)
+        self.S = torch.stack(S, dim=0)
         R = torch.stack(R, dim=0)
 
         t = torch.matmul(-R, src.mean(dim=2, keepdim=True)) + src_corr.mean(dim=2, keepdim=True)
-        return R, t.view(batch_size, 3)
+        
+        return R, t.view(batch_size, 3)    
+  
+class GravityLayer(nn.Module):
+    def __init__(self, emb_dims):
+        super(GravityLayer, self).__init__()
+        # 정보이론 관점: P와 Q의 전역 특징을 결합하여 상관관계를 학습
+        self.joint_nn = nn.Sequential(
+            nn.Linear(emb_dims * 2, emb_dims),
+            nn.BatchNorm1d(emb_dims),
+            nn.ReLU(),
+            nn.Linear(emb_dims, emb_dims // 2),
+            nn.ReLU(),
+            nn.Linear(emb_dims // 2, 8) # (mu_p, k_p, mu_q, k_q)
+        )
+
+    def forward(self, src_emb, tgt_emb):
+        # Global Feature (B, C)
+        src_g = torch.max(src_emb, dim=-1)[0]
+        tgt_g = torch.max(tgt_emb, dim=-1)[0]
+        
+        # Joint Inference
+        combined = torch.cat([src_g, tgt_g], dim=1)
+        out = self.joint_nn(combined) # (B, 8)
+
+        # (g_p, k_p), (g_q, k_q) 형태로 반환
+        g_p = F.normalize(out[:, 0:3], p=2, dim=1)
+        k_p = F.softplus(out[:, 3:4]) + 1.0
+        g_q = F.normalize(out[:, 4:7], p=2, dim=1)
+        k_q = F.softplus(out[:, 7:8]) + 1.0
+
+        return (g_p, k_p), (g_q, k_q)
+
+class GravityAligner(nn.Module):
+    """
+    Compute rotation R such that R @ g_src = g_tgt (both unit vectors).
+    Batch-safe, handles parallel / anti-parallel cases.
+    """
+    def __init__(self, eps=1e-8):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, g_src: torch.Tensor, g_tgt: torch.Tensor) -> torch.Tensor:
+        # g_src, g_tgt: (B, 3) assumed normalized (still normalize for safety)
+        u = F.normalize(g_src, dim=1, eps=self.eps)
+        v = F.normalize(g_tgt, dim=1, eps=self.eps)
+
+        # axis = u x v
+        axis = torch.cross(u, v, dim=1)                          # (B,3)
+        axis_norm = torch.norm(axis, dim=1, keepdim=True)        # (B,1)
+        dot = torch.sum(u * v, dim=1, keepdim=True).clamp(-1.0, 1.0)  # (B,1)
+
+        # If parallel: axis ~ 0
+        parallel = (axis_norm < 1e-6)
+
+        # Rodrigues: R = I + sinθ K + (1-cosθ) K^2, where K = skew(k), k = axis/||axis||
+        k = axis / (axis_norm + self.eps)                        # (B,3)
+        theta = torch.acos(dot)                                   # (B,1)
+        sin_t = torch.sin(theta)
+        cos_t = torch.cos(theta)
+
+        K = self._skew(k)                                         # (B,3,3)
+        I = torch.eye(3, device=g_src.device, dtype=g_src.dtype).unsqueeze(0)  # (1,3,3)
+
+        R = I + sin_t.view(-1,1,1) * K + (1 - cos_t).view(-1,1,1) * (K @ K)
+
+        # Anti-parallel special handling: dot ~ -1 & axis ~ 0  => pick any orthogonal axis
+        antipar = parallel & (dot < 0.0)
+        if antipar.any():
+            # choose a basis vector not parallel to u: use e_x unless u close to e_x, else e_y
+            ex = torch.tensor([1.0, 0.0, 0.0], device=u.device, dtype=u.dtype).view(1,3).repeat(u.size(0),1)
+            ey = torch.tensor([0.0, 1.0, 0.0], device=u.device, dtype=u.dtype).view(1,3).repeat(u.size(0),1)
+
+            use_ex = (torch.abs(u[:,0:1]) < 0.9)  # if u not too aligned with x
+            basis = torch.where(use_ex, ex, ey)
+            axis2 = torch.cross(u, basis, dim=1)
+            axis2 = F.normalize(axis2, dim=1, eps=self.eps)
+            K2 = self._skew(axis2)
+            # 180deg rotation: R = I + 2 K^2 (since sinπ=0, 1-cosπ = 2)
+            R_anti = I + 2.0 * (K2 @ K2)
+            R = torch.where(antipar.view(-1,1,1), R_anti, R)
+
+        # Pure parallel (dot>0): identity
+        R = torch.where(parallel.view(-1,1,1) & (dot > 0.0).view(-1,1,1), I, R)
+        return R
+
+    @staticmethod
+    def _skew(k: torch.Tensor) -> torch.Tensor:
+        # k: (B,3)
+        B = k.size(0)
+        kx, ky, kz = k[:,0], k[:,1], k[:,2]
+        O = torch.zeros(B, device=k.device, dtype=k.dtype)
+        K = torch.stack([
+            torch.stack([O, -kz,  ky], dim=1),
+            torch.stack([kz,  O, -kx], dim=1),
+            torch.stack([-ky, kx,  O], dim=1)
+        ], dim=1)
+        return K
+
+
+class GravityHypothesisTester(nn.Module):
+    """
+    test.py의 로직을 DCP 내부에서 쓰기 위한 모듈:
+    - gravity align (P->Q frame)
+    - centroid shift
+    - NN correspondence
+    - distance gate + kappa/chi2 inclination gate
+    Returns: w_p, w_q, and optionally indices/dist for debugging.
+    """
+    def __init__(self, chi2_thresh=9.0, dist_scale=3.0, eps=1e-6):
+        super().__init__()
+        self.chi2_thresh = chi2_thresh
+        self.dist_scale = dist_scale
+        self.eps = eps
+        self.aligner = GravityAligner(eps=eps)
+
+    def forward(self, src, tgt, src_n, tgt_n, g_p, k_p, g_q, k_q, return_debug=False):
+        """
+        src,tgt: (B,3,N)
+        src_n,tgt_n: (B,3,N)
+        g_p,g_q: (B,3)
+        k_p,k_q: (B,1)
+        """
+        B, _, N = src.shape
+
+        # 1) gravity align: bring src(+normal) into tgt frame
+        R_g = self.aligner(g_p, g_q)                    # (B,3,3)
+        src_rot = torch.matmul(R_g, src)                # (B,3,N)
+        src_n_rot = torch.matmul(R_g, src_n)            # (B,3,N)
+
+        # 2) centroid shift (same as test.py)
+        t_center = tgt.mean(dim=2, keepdim=True) - src_rot.mean(dim=2, keepdim=True)   # (B,3,1)
+        src_init = src_rot + t_center
+
+        # 3) NN in aligned frame: dist matrix between src_init and tgt
+        dist_pq = self._get_dist_mat(src_init, tgt)     # (B,N,N)
+        min_pq, corr_p2q = torch.min(dist_pq, dim=2)    # (B,N)
+        min_qp, corr_q2p = torch.min(dist_pq.transpose(1,2), dim=2)  # (B,N)
+
+        # 4) distance gate (tau = dist_scale * median(nn_dist))
+        # use sqrt because dist_mat is squared distance
+        nn_d_p = torch.sqrt(min_pq.clamp_min(0.0) + self.eps)        # (B,N)
+        nn_d_q = torch.sqrt(min_qp.clamp_min(0.0) + self.eps)        # (B,N)
+
+        tau_p = self.dist_scale * nn_d_p.median(dim=1, keepdim=True).values  # (B,1)
+        tau_q = self.dist_scale * nn_d_q.median(dim=1, keepdim=True).values  # (B,1)
+
+        geom_p = (nn_d_p <= tau_p).float()   # (B,N)
+        geom_q = (nn_d_q <= tau_q).float()   # (B,N)
+
+        # 5) gather matched normals
+        tgt_n_matched_for_p = self._gather_by_index(tgt_n, corr_p2q)      # (B,3,N)
+        src_n_matched_for_q = self._gather_by_index(src_n_rot, corr_q2p)  # (B,3,N)
+
+        # 6) inclination (frame-consistent: 모두 tgt frame의 g_q로 dot)
+        # inc_p: (B,N), inc_p_ref: (B,N)
+        inc_p = torch.sum(src_n_rot * g_q.unsqueeze(2), dim=1)
+        inc_p_ref = torch.sum(tgt_n_matched_for_p * g_q.unsqueeze(2), dim=1)
+
+        inc_q = torch.sum(tgt_n * g_q.unsqueeze(2), dim=1)
+        inc_q_ref = torch.sum(src_n_matched_for_q * g_q.unsqueeze(2), dim=1)
+
+        # 7) chi2/kappa gate
+        k_eff = (k_p * k_q) / (k_p + k_q + self.eps)    # (B,1)
+        # broadcast k_eff to (B,N)
+        k_eff = k_eff.expand(-1, N)
+
+        w_p = torch.sigmoid(self.chi2_thresh - k_eff * (inc_p - inc_p_ref).pow(2)) * geom_p
+        w_q = torch.sigmoid(self.chi2_thresh - k_eff * (inc_q - inc_q_ref).pow(2)) * geom_q
+
+        w_p = w_p.unsqueeze(1)  # (B,1,N)
+        w_q = w_q.unsqueeze(1)  # (B,1,N)
+
+        if return_debug:
+            debug = {
+                "R_g": R_g,
+                "t_center": t_center,
+                "corr_p2q": corr_p2q,
+                "corr_q2p": corr_q2p,
+                "nn_d_p_median": nn_d_p.median(dim=1).values,
+                "nn_d_q_median": nn_d_q.median(dim=1).values,
+                "tau_p": tau_p.squeeze(1),
+                "tau_q": tau_q.squeeze(1),
+                "w_p_mean": w_p.mean(dim=2).squeeze(1),
+                "w_q_mean": w_q.mean(dim=2).squeeze(1),
+            }
+            return w_p, w_q, debug
+
+        return w_p, w_q
+
+    @staticmethod
+    def _get_dist_mat(src, tgt):
+        # src,tgt: (B,3,N) -> dist: (B,N,N), squared Euclidean
+        inner = -2 * torch.matmul(src.transpose(2, 1), tgt)  # (B,N,N)
+        xx = torch.sum(src**2, dim=1, keepdim=True).transpose(2, 1)  # (B,N,1)
+        yy = torch.sum(tgt**2, dim=1, keepdim=True)                  # (B,1,N)
+        return xx + inner + yy
+
+    @staticmethod
+    def _gather_by_index(x, idx):
+        """
+        x: (B,3,Nx), idx: (B,N) in [0, Nx)
+        return: (B,3,N)
+        """
+        B, C, Nx = x.shape
+        N = idx.size(1)
+        idx_exp = idx.unsqueeze(1).expand(-1, C, -1)  # (B,3,N)
+        return torch.gather(x, dim=2, index=idx_exp)
+
 
 class DCP(nn.Module):
     def __init__(self, args):
         super(DCP, self).__init__()
+        
         self.emb_dims = args.emb_dims
         self.cycle = args.cycle
+        self.chi2_thresh = getattr(args, 'chi2_thresh', 9.0)
+        self.k_samples = getattr(args, 'k_samples', 128)
+        self.hypo_tester = GravityHypothesisTester(
+                chi2_thresh=self.chi2_thresh,
+                dist_scale=getattr(args, "dist_scale", 3.0),   # test.py의 "3.0 * resolution"에 해당하는 역할
+                eps=1e-6
+)
+
         if args.emb_nn == 'pointnet':
-            self.emb_nn = PointNet(emb_dims=self.emb_dims)
+            self.emb_nn = PointNet(emb_dims=self.emb_dims, normal=True)
         elif args.emb_nn == 'dgcnn':
             self.emb_nn = DGCNN(emb_dims=self.emb_dims)
         else:
             raise Exception('Not implemented')
 
+        if getattr(args, 'gravity', False):
+            self.gravity_layer = GravityLayer(self.emb_dims) 
+        else:
+            None
+            
         if args.pointer == 'identity':
             self.pointer = Identity()
         elif args.pointer == 'transformer':
@@ -479,26 +713,122 @@ class DCP(nn.Module):
             self.head = SVDHead(args=args)
         else:
             raise Exception('Not implemented')
+    
+    # def _nearest_neighbor(self, src, tgt):
+    #     with torch.no_grad():
+    #             inner = -2 * torch.matmul(src.transpose(2, 1), tgt)
+    #             xx = torch.sum(src**2, dim=1, keepdim=True).transpose(2, 1)
+    #             yy = torch.sum(tgt**2, dim=1, keepdim=True)
+    #             dist_mat = xx + inner + yy
+    #             _, corr_idx = torch.min(dist_mat, dim=2) # (B, N)
+    #     return corr_idx
+    
+    def _get_dist_mat(self, src, tgt):
+        inner = -2 * torch.matmul(src.transpose(2, 1), tgt)
+        xx = torch.sum(src**2, dim=1, keepdim=True).transpose(2, 1)
+        yy = torch.sum(tgt**2, dim=1, keepdim=True)
+        return xx + inner + yy
+    
+    def _geometric_hypothesis_test(self, src, tgt, src_n, tgt_n, g_p, k_p, g_q, k_q):
+        """ 
+        양방향 기하학적 가설 검정을 수행하여 src용, tgt용 마스크를 각각 반환 
+        """
+        batch_size, _, num_points = src.size()
+        
+        # 1. 양방향 NN 인덱스 추출 (P->Q, Q->P)
+        with torch.no_grad():
+            # P to Q
+            dist_pq = self._get_dist_mat(src, tgt)
+            _, corr_p2q = torch.min(dist_pq, dim=2)
+            # Q to P
+            dist_qp = dist_pq.transpose(1, 2)
+            _, corr_q2p = torch.min(dist_qp, dim=2)
+        
+        # 2. 대응되는 법선 벡터 정렬
+        def get_matched_n(indices, target_n):
+            idx_base = torch.arange(batch_size, device=src.device).view(-1, 1) * num_points
+            flat_idx = (indices + idx_base).view(-1)
+            matched = target_n.transpose(1, 2).contiguous().view(-1, 3)[flat_idx, :]
+            return matched.view(batch_size, num_points, 3).transpose(1, 2)
 
+        src_n_matched = get_matched_n(corr_q2p, src_n) # Q의 대응점인 P의 법선
+        tgt_n_matched = get_matched_n(corr_p2q, tgt_n) # P의 대응점인 Q의 법선
+
+        # 3. 통계량 계산
+        k_eff = (k_p * k_q) / (k_p + k_q + 1e-6)
+        
+        # Source용 마스크 (P가 Q와 얼마나 일치하는가)
+        inc_p = torch.sum(src_n * g_p.unsqueeze(2), dim=1)
+        inc_p_ref = torch.sum(tgt_n_matched * g_q.unsqueeze(2), dim=1)
+        w_p = torch.sigmoid(self.chi2_thresh - k_eff * (inc_p - inc_p_ref)**2)
+
+        # Target용 마스크 (Q가 P와 얼마나 일치하는가)
+        inc_q = torch.sum(tgt_n * g_q.unsqueeze(2), dim=1)
+        inc_q_ref = torch.sum(src_n_matched * g_p.unsqueeze(2), dim=1)
+        w_q = torch.sigmoid(self.chi2_thresh - k_eff * (inc_q - inc_q_ref)**2)
+
+        return w_p.unsqueeze(1), w_q.unsqueeze(1)
+    
     def forward(self, *input):
         src = input[0]
         tgt = input[1]
-        src_embedding = self.emb_nn(src)
-        tgt_embedding = self.emb_nn(tgt)
+        
+        src_embedding, src_n = self.emb_nn(src)
+        tgt_embedding, tgt_n = self.emb_nn(tgt)
 
+        if self.gravity_layer is not None:
+            (g_p, k_p), (g_q, k_q) = self.gravity_layer(src_embedding, tgt_embedding)
+            w_p, w_q = self.hypo_tester(src, tgt, src_n, tgt_n, g_p, k_p, g_q, k_q)
+
+            src_embedding = src_embedding * w_p
+            tgt_embedding = tgt_embedding * w_q
+            
+            # Inference 시에만 Top-K 샘플링 적용
+            if (not self.training) and (self.k_samples < src_embedding.size(-1)):
+                B, C, N = src_embedding.shape           # (B, C, N)
+                K = self.k_samples
+
+                # w_p, w_q: (B, 1, N)
+                _, top_k_p = torch.topk(w_p.squeeze(1), K, dim=1)  # (B, K)
+                _, top_k_q = torch.topk(w_q.squeeze(1), K, dim=1)  # (B, K)
+
+                # 1) Embedding gather: (B, C, N) -> (B, C, K)
+                idx_p_emb = top_k_p.unsqueeze(1).expand(-1, C, -1)  # (B, C, K)
+                idx_q_emb = top_k_q.unsqueeze(1).expand(-1, C, -1)  # (B, C, K)
+
+                src_embedding = torch.gather(src_embedding, dim=2, index=idx_p_emb)  # (B, C, K)
+                tgt_embedding = torch.gather(tgt_embedding, dim=2, index=idx_q_emb)  # (B, C, K)
+
+                # 2) Point gather: (B, 3, N) -> (B, 3, K)
+                idx_p_xyz = top_k_p.unsqueeze(1).expand(-1, 3, -1)  # (B, 3, K)
+                idx_q_xyz = top_k_q.unsqueeze(1).expand(-1, 3, -1)  # (B, 3, K)
+
+                src_topk = torch.gather(src, dim=2, index=idx_p_xyz)  # (B, 3, K)
+                tgt_topk = torch.gather(tgt, dim=2, index=idx_q_xyz)  # (B, 3, K)
+
+            else:
+                src_topk = src
+                tgt_topk = tgt
+                
+        # [Step 3] Pointer & Pose Head
         src_embedding_p, tgt_embedding_p = self.pointer(src_embedding, tgt_embedding)
-
         src_embedding = src_embedding + src_embedding_p
         tgt_embedding = tgt_embedding + tgt_embedding_p
 
-        rotation_ab, translation_ab = self.head(src_embedding, tgt_embedding, src, tgt)
+        rotation_ab, translation_ab = self.head(src_embedding, tgt_embedding, src_topk, tgt_topk)
         if self.cycle:
-            rotation_ba, translation_ba = self.head(tgt_embedding, src_embedding, tgt, src)
+            rotation_ba, translation_ba = self.head(tgt_embedding, src_embedding, tgt_topk, src_topk)
 
         else:
             rotation_ba = rotation_ab.transpose(2, 1).contiguous()
             translation_ba = -torch.matmul(rotation_ba, translation_ab.unsqueeze(2)).squeeze(2)
-        return rotation_ab, translation_ab, rotation_ba, translation_ba
+        
+        return rotation_ab, translation_ab, rotation_ba, translation_ba, {
+            'g_p': g_p if self.gravity_layer is not None else None,
+            'k_p': k_p if self.gravity_layer is not None else None,
+            'g_q': g_q if self.gravity_layer is not None else None,
+            'k_q': k_q if self.gravity_layer is not None else None,
+        }
     
 if __name__ == '__main__':
     
@@ -521,12 +851,13 @@ if __name__ == '__main__':
     parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate')
     parser.add_argument('--ff_dims', type=int, default=1024, help='Dimension of feedforward network in Transformer')
     parser.add_argument('--n_heads', type=int, default=8, help='Number of attention heads in Transformer')
-    parser.add_argument('--emb_nn', type=str, default='dgcnn', choices=['pointnet', 'dgcnn'],
+    parser.add_argument('--emb_nn', type=str, default='pointnet', choices=['pointnet', 'dgcnn'],
                         help='Point cloud embedding network')
     parser.add_argument('--pointer', type=str, default='transformer', choices=['identity', 'transformer'],
                         help='Pointer network')
     parser.add_argument('--head', type=str, default='svd', choices=['mlp', 'svd'], help='Transformation head')
     parser.add_argument('--cycle', action='store_true', help='Use cycle consistency')
+    parser.add_argument('--gravity', action='store_true', help='Use gravity alignment layer')
     args = parser.parse_args()
     
     # Model Forward Test
@@ -543,10 +874,12 @@ if __name__ == '__main__':
                 'unseen': False,
                 'factor': 1,
                 'keep_ratio': 1.0,
-                'num_workers': 0
+                'num_workers': 0,
+                'partial_overlap': False,
+                'distance_range': 0.1
             },
             'training': {
-                'batch_size': 1
+                'batch_size': 16
             }
         })
     )
@@ -555,21 +888,17 @@ if __name__ == '__main__':
     model = DCP(args=args).to(device)
     print(f"Model has {count_parameters(model):,} trainable parameters")
     
-    p = sample['p'].to(device)  # (B, 3, N)
-    q = sample['q'].to(device)  # (B, 3, N)
+     # Data Load
+    P = sample['P'].to('cuda')         
+    Q = sample['Q'].to('cuda')         
+    g_p = sample['g_p'].to('cuda') 
+    g_q = sample['g_q'].to('cuda') 
+    R_gt = sample['R_gt'].to('cuda')
+    t_gt = sample['t_gt'].to('cuda')
     
-    rotation_ab, translation_ab, rotation_ba, translation_ba = model(p, q)
+    R_pq, t_pq, R_qp, t_qp, aux = model(P, Q)
+    loss, loss_dict = loss_fn(R_pq, t_pq, R_gt, t_gt, R_qp, t_qp, aux)
     
-    loss = loss_fn(
-        rotation_ab_pred = rotation_ab,
-        translation_ab_pred = translation_ab.unsqueeze(2),
-        rotation_ab = sample['R_pq'].to(device),
-        translation_ab = sample['t_pq'].to(device).unsqueeze(2)
-    )
-    print("Rotation AB:", rotation_ab.size())
-    print("Translation AB:", translation_ab.size())
-    print("Rotation BA:", rotation_ba.size())
-    print("Translation BA:", translation_ba.size())
     print("Loss:", loss.item())
     
     # Backward test

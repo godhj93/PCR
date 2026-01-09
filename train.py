@@ -67,11 +67,11 @@ def train(cfg: DictConfig) -> None:
                         cfg = cfg)
         
         
-        result = logging_tensorboard(writer, result, epoch, optimizer)
+        logging_tensorboard(writer, result, epoch, optimizer)
         
         log.info(colored(f"Epoch [{epoch}/{cfg.training.epochs}] - "
                         f"Train Loss: {result['train_loss']:.4f}, Test Loss: {result['val_loss']:.4f}, "
-                        f"RRE: {result['RRE']:.2f}°, RTE: {result['RTE']:.4f}, "
+                        f"RRE: {result['val_rre_mean']:.2f}°, RTE: {result['val_rte_mean']:.4f}, "
                         f"LR: {optimizer.param_groups[0]['lr']:.6f}", "cyan"))
 
         # save checkpoint

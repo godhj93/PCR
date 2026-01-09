@@ -83,3 +83,32 @@ class DCPLoss(nn.Module):
             
             
         return loss, {'loss': loss.item(), 'cycle_loss': cycle_loss.item() if self.cycle else 0.0}
+    
+class ELBOObjective(nn.Module):
+    def __init__(self, beta):
+        super(ELBOObjective, self).__init__()
+        
+        self.beta = beta
+        
+        self.vmf_loss = VMFLoss()
+        self.DCPLoss = DCPLoss()   
+        
+    def forward(self, DCP, g_GT, VMF):
+        
+        dcp_loss, dcp_loss_dict = self.DCPLoss(*DCP)
+        g_p_GT, g_q_GT = g_GT
+        
+        g_p, k_p, g_q, k_q = VMF['g_p'], VMF['k_p'], VMF['g_q'], VMF['k_q']
+        vmf_loss_p = self.vmf_loss(g_p, k_p, g_p_GT)
+        vmf_loss_q = self.vmf_loss(g_q, k_q, g_q_GT)
+        
+        total_loss = dcp_loss + self.beta * (vmf_loss_p + vmf_loss_q)/2.0
+        
+        loss_dict = {
+            'dcp': dcp_loss_dict,
+            'vmf_loss': ((vmf_loss_p + vmf_loss_q)/2.0).item()
+        }
+        
+        return total_loss, loss_dict
+        
+        

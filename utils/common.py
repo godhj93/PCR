@@ -62,7 +62,7 @@ def train_one_epoch(model, data_loader, optimizer, scheduler, loss_fn, epoch, me
     AvgMeter_train = metric['train']
     
     for batch in pbar:
-        
+
         # Data Load
         P = batch['P'].to(cfg.device)         
         Q = batch['Q'].to(cfg.device)         
@@ -72,8 +72,8 @@ def train_one_epoch(model, data_loader, optimizer, scheduler, loss_fn, epoch, me
         t_gt = batch['t_gt'].to(cfg.device)
         
         # Forward Pass
-        R_pq, t_pq, R_qp, t_qp = model(P, Q)
-        loss, loss_dict = loss_fn(R_pq, t_pq, R_gt, t_gt, R_qp, t_qp)
+        R_pq, t_pq, R_qp, t_qp, gravity = model(P, Q)
+        loss, loss_dict = loss_fn((R_pq, t_pq, R_gt, t_gt, R_qp, t_qp), (g_p, g_q), gravity)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -82,7 +82,7 @@ def train_one_epoch(model, data_loader, optimizer, scheduler, loss_fn, epoch, me
         
         # Progress bar with detailed loss breakdown
         desc = (f"Epoch [{epoch}/{cfg.training.epochs}] "
-                f"Loss Avg: {AvgMeter_train.avg:.4f} (Loss: {loss_dict['loss']:.4f} | Cycle: {loss_dict['cycle_loss']:.4f}) "
+                f"Loss Avg: {AvgMeter_train.avg:.4f} (Loss: {loss_dict['dcp']['loss']:.4f} | Cycle: {loss_dict['dcp']['cycle_loss']:.4f} | VMF: {loss_dict['vmf_loss']:.4f}) "
                 f"LR: {optimizer.param_groups[0]['lr']:.6f}")
 
         pbar.set_description(desc)
@@ -90,10 +90,13 @@ def train_one_epoch(model, data_loader, optimizer, scheduler, loss_fn, epoch, me
     scheduler.step()
     
     train_loss = AvgMeter_train.avg    
-    val_metrics = test_one_epoch(model, data_loader['test'], loss_fn, metric, cfg, epoch)
+    metrics = test_one_epoch(model, data_loader['test'], loss_fn, metric, cfg, epoch)
     
-    return train_loss, val_metrics
+    # add train loss to metrics
+    metrics['train_loss'] = train_loss
     
+    return metrics
+
 def test_one_epoch(model, test_loader, loss_fn, metric, cfg, epoch=0):
     
     model.eval()
@@ -116,8 +119,8 @@ def test_one_epoch(model, test_loader, loss_fn, metric, cfg, epoch=0):
             t_gt = batch['t_gt'].to(cfg.device)   
             
             # Forward Pass
-            R_pq, t_pq, R_qp, t_qp = model(P, Q)
-            loss, loss_dict = loss_fn(R_pq, t_pq, R_gt, t_gt, R_qp, t_qp)
+            R_pq, t_pq, R_qp, t_qp, gravity = model(P, Q)
+            loss, loss_dict = loss_fn((R_pq, t_pq, R_gt, t_gt, R_qp, t_qp), (g_p, g_q), gravity)
             
             # Compute RRE and RTE
             rre = compute_rotation_error(R_pq, R_gt)  # (B,) degrees
@@ -142,34 +145,20 @@ def test_one_epoch(model, test_loader, loss_fn, metric, cfg, epoch=0):
     rte_all = torch.cat(rte_list)
     
     metrics = {
-        'loss': AvgMeter_val.avg,
-        'rre_mean': rre_all.mean().item(),
-        'rre_median': rre_all.median().item(),
-        'rte_mean': rte_all.mean().item(),
-        'rte_median': rte_all.median().item(),
+        'val_loss': AvgMeter_val.avg,
+        'val_rre_mean': rre_all.mean().item(),
+        'val_rte_mean': rte_all.mean().item(),
     }
             
     return metrics
 
 def logging_tensorboard(writer, result, epoch, optimizer):
     
-    train_loss = result['train_loss']
-    val_metrics = result['val_metrics']
     
-    writer.add_scalar("Loss/train/total", train_loss, epoch)
-    writer.add_scalar("Loss/val/total", val_metrics['loss'], epoch)
+    writer.add_scalar("Loss/train/total", result['train_loss'], epoch)
+    writer.add_scalar("Loss/val/total", result['val_loss'], epoch)
     
-    # Log RRE and RTE
-    writer.add_scalar("Metrics/val/RRE_mean", val_metrics['rre_mean'], epoch)
-    writer.add_scalar("Metrics/val/RRE_median", val_metrics['rre_median'], epoch)
-    writer.add_scalar("Metrics/val/RTE_mean", val_metrics['rte_mean'], epoch)
-    writer.add_scalar("Metrics/val/RTE_median", val_metrics['rte_median'], epoch)
-    
+    writer.add_scalar("Metrics/val/RRE_mean", result['val_rre_mean'], epoch)
+    writer.add_scalar("Metrics/val/RTE_mean", result['val_rte_mean'], epoch)
     writer.add_scalar("Learning_Rate", optimizer.param_groups[0]['lr'], epoch)
     
-    return {
-        'train_loss': train_loss,
-        'val_loss': val_metrics['loss'],
-        'RRE': val_metrics['rre_mean'],
-        'RTE': val_metrics['rte_mean']
-    }
