@@ -1,907 +1,484 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-
-
-import os
-import sys
-import glob
-import h5py
-import copy
-import math
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.autograd import Variable
-from scipy.spatial.transform import Rotation
-from utils.layers import NormalEstimator
+from utils.layers import VNLinearLeakyReLU, VNLinear, VNInvariant, VN_Attention, VN_Cross_Gating, VNMaxPool, NormalEstimator
+import numpy as np
 
-def quat2mat(quat):
-    x, y, z, w = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
-
-    B = quat.size(0)
-
-    w2, x2, y2, z2 = w.pow(2), x.pow(2), y.pow(2), z.pow(2)
-    wx, wy, wz = w*x, w*y, w*z
-    xy, xz, yz = x*y, x*z, y*z
-
-    rotMat = torch.stack([w2 + x2 - y2 - z2, 2*xy - 2*wz, 2*wy + 2*xz,
-                          2*wz + 2*xy, w2 - x2 + y2 - z2, 2*yz - 2*wx,
-                          2*xz - 2*wy, 2*wx + 2*yz, w2 - x2 - y2 + z2], dim=1).reshape(B, 3, 3)
-    return rotMat
-
-
-def transform_point_cloud(point_cloud, rotation, translation):
-    if len(rotation.size()) == 2:
-        rot_mat = quat2mat(rotation)
-    else:
-        rot_mat = rotation
-    return torch.matmul(rot_mat, point_cloud) + translation.unsqueeze(2)
-
-
-def npmat2euler(mats, seq='zyx'):
-    eulers = []
-    for i in range(mats.shape[0]):
-        r = Rotation.from_dcm(mats[i])
-        eulers.append(r.as_euler(seq, degrees=True))
-    return np.asarray(eulers, dtype='float32')
-
-
-# Part of the code is referred from: http://nlp.seas.harvard.edu/2018/04/03/attention.html#positional-encoding
-
-def clones(module, N):
-    return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
-
-
-def attention(query, key, value, mask=None, dropout=None):
-    d_k = query.size(-1)
-    scores = torch.matmul(query, key.transpose(-2, -1).contiguous()) / math.sqrt(d_k)
-    if mask is not None:
-        scores = scores.masked_fill(mask == 0, -1e9)
-    p_attn = F.softmax(scores, dim=-1)
-    return torch.matmul(p_attn, value), p_attn
-
-
-def nearest_neighbor(src, dst):
-    inner = -2 * torch.matmul(src.transpose(1, 0).contiguous(), dst)  # src, dst (num_dims, num_points)
-    distances = -torch.sum(src ** 2, dim=0, keepdim=True).transpose(1, 0).contiguous() - inner - torch.sum(dst ** 2,
-                                                                                                           dim=0,
-                                                                                                           keepdim=True)
-    distances, indices = distances.topk(k=1, dim=-1)
-    return distances, indices
-
-
-def knn(x, k):
-    inner = -2 * torch.matmul(x.transpose(2, 1).contiguous(), x)
-    xx = torch.sum(x ** 2, dim=1, keepdim=True)
-    pairwise_distance = -xx - inner - xx.transpose(2, 1).contiguous()
-
-    idx = pairwise_distance.topk(k=k, dim=-1)[1]  # (batch_size, num_points, k)
-    return idx
-
-
-def get_graph_feature(x, k=20):
-    # x = x.squeeze()
-    idx = knn(x, k=k)  # (batch_size, num_points, k)
-    batch_size, num_points, _ = idx.size()
-    device = x.device  # Use the same device as input tensor
-
-    idx_base = torch.arange(0, batch_size, device=device).view(-1, 1, 1) * num_points
-
-    idx = idx + idx_base
-
-    idx = idx.view(-1)
-
-    _, num_dims, _ = x.size()
-
-    x = x.transpose(2,
-                    1).contiguous()  # (batch_size, num_points, num_dims)  -> (batch_size*num_points, num_dims) #   batch_size * num_points * k + range(0, batch_size*num_points)
-    feature = x.view(batch_size * num_points, -1)[idx, :]
-    feature = feature.view(batch_size, num_points, k, num_dims)
-    x = x.view(batch_size, num_points, 1, num_dims).repeat(1, 1, k, 1)
-
-    feature = torch.cat((feature, x), dim=3).permute(0, 3, 1, 2)
-
-    return feature
-
-
-class EncoderDecoder(nn.Module):
+# ==============================================================================
+# [Common] Utility Modules
+# ==============================================================================
+class TimeEmbedding(nn.Module):
     """
-    A standard Encoder-Decoder architecture. Base for this and many
-    other models.
+    Scalar 시간 t를 고차원 벡터로 변환 (Gaussian Fourier Projection)
     """
+    def __init__(self, embed_dim, scale=30.):
+        super().__init__()
+        self.W = nn.Parameter(torch.randn(embed_dim // 2) * scale, requires_grad=False)
+    
+    def forward(self, t):
+        t = t.view(-1, 1) if t.dim() == 1 else t
+        t_proj = t * self.W[None, :] * 2 * np.pi
+        return torch.cat([torch.sin(t_proj), torch.cos(t_proj)], dim=-1)
 
-    def __init__(self, encoder, decoder, src_embed, tgt_embed, generator):
-        super(EncoderDecoder, self).__init__()
-        self.encoder = encoder
-        self.decoder = decoder
-        self.src_embed = src_embed
-        self.tgt_embed = tgt_embed
-        self.generator = generator
-
-    def forward(self, src, tgt, src_mask, tgt_mask):
-        "Take in and process masked src and target sequences."
-        return self.decode(self.encode(src, src_mask), src_mask,
-                           tgt, tgt_mask)
-
-    def encode(self, src, src_mask):
-        return self.encoder(self.src_embed(src), src_mask)
-
-    def decode(self, memory, src_mask, tgt, tgt_mask):
-        return self.generator(self.decoder(self.tgt_embed(tgt), memory, src_mask, tgt_mask))
-
-
-class Generator(nn.Module):
-    def __init__(self, emb_dims):
-        super(Generator, self).__init__()
-        self.nn = nn.Sequential(nn.Linear(emb_dims, emb_dims // 2),
-                                nn.BatchNorm1d(emb_dims // 2),
-                                nn.ReLU(),
-                                nn.Linear(emb_dims // 2, emb_dims // 4),
-                                nn.BatchNorm1d(emb_dims // 4),
-                                nn.ReLU(),
-                                nn.Linear(emb_dims // 4, emb_dims // 8),
-                                nn.BatchNorm1d(emb_dims // 8),
-                                nn.ReLU())
-        self.proj_rot = nn.Linear(emb_dims // 8, 4)
-        self.proj_trans = nn.Linear(emb_dims // 8, 3)
-
-    def forward(self, x):
-        x = self.nn(x.max(dim=1)[0])
-        rotation = self.proj_rot(x)
-        translation = self.proj_trans(x)
-        rotation = rotation / torch.norm(rotation, p=2, dim=1, keepdim=True)
-        return rotation, translation
-
-
-class Encoder(nn.Module):
-    def __init__(self, layer, N):
-        super(Encoder, self).__init__()
-        self.layers = clones(layer, N)
-        self.norm = LayerNorm(layer.size)
-
-    def forward(self, x, mask):
-        for layer in self.layers:
-            x = layer(x, mask)
-        return self.norm(x)
-
-
-class Decoder(nn.Module):
-    "Generic N layer decoder with masking."
-
-    def __init__(self, layer, N):
-        super(Decoder, self).__init__()
-        self.layers = clones(layer, N)
-        self.norm = LayerNorm(layer.size)
-
-    def forward(self, x, memory, src_mask, tgt_mask):
-        for layer in self.layers:
-            x = layer(x, memory, src_mask, tgt_mask)
-        return self.norm(x)
-
-
-class LayerNorm(nn.Module):
-    def __init__(self, features, eps=1e-6):
-        super(LayerNorm, self).__init__()
-        self.a_2 = nn.Parameter(torch.ones(features))
-        self.b_2 = nn.Parameter(torch.zeros(features))
-        self.eps = eps
-
-    def forward(self, x):
-        mean = x.mean(-1, keepdim=True)
-        std = x.std(-1, keepdim=True)
-        return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
-
-
-class SublayerConnection(nn.Module):
-    def __init__(self, size, dropout=None):
-        super(SublayerConnection, self).__init__()
-        self.norm = LayerNorm(size)
-
-    def forward(self, x, sublayer):
-        return x + sublayer(self.norm(x))
-
-
-class EncoderLayer(nn.Module):
-    def __init__(self, size, self_attn, feed_forward, dropout):
-        super(EncoderLayer, self).__init__()
-        self.self_attn = self_attn
-        self.feed_forward = feed_forward
-        self.sublayer = clones(SublayerConnection(size, dropout), 2)
-        self.size = size
-
-    def forward(self, x, mask):
-        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, mask))
-        return self.sublayer[1](x, self.feed_forward)
-
-
-class DecoderLayer(nn.Module):
-    "Decoder is made of self-attn, src-attn, and feed forward (defined below)"
-
-    def __init__(self, size, self_attn, src_attn, feed_forward, dropout):
-        super(DecoderLayer, self).__init__()
-        self.size = size
-        self.self_attn = self_attn
-        self.src_attn = src_attn
-        self.feed_forward = feed_forward
-        self.sublayer = clones(SublayerConnection(size, dropout), 3)
-
-    def forward(self, x, memory, src_mask, tgt_mask):
-        "Follow Figure 1 (right) for connections."
-        m = memory
-        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, tgt_mask))
-        x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, src_mask))
-        return self.sublayer[2](x, self.feed_forward)
-
-
-class MultiHeadedAttention(nn.Module):
-    def __init__(self, h, d_model, dropout=0.1):
-        "Take in model size and number of heads."
-        super(MultiHeadedAttention, self).__init__()
-        assert d_model % h == 0
-        # We assume d_v always equals d_k
-        self.d_k = d_model // h
-        self.h = h
-        self.linears = clones(nn.Linear(d_model, d_model), 4)
-        self.attn = None
-        self.dropout = None
-
-    def forward(self, query, key, value, mask=None):
-        "Implements Figure 2"
-        if mask is not None:
-            # Same mask applied to all h heads.
-            mask = mask.unsqueeze(1)
-        nbatches = query.size(0)
-
-        # 1) Do all the linear projections in batch from d_model => h x d_k
-        query, key, value = \
-            [l(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2).contiguous()
-             for l, x in zip(self.linears, (query, key, value))]
-
-        # 2) Apply attention on all the projected vectors in batch.
-        x, self.attn = attention(query, key, value, mask=mask,
-                                 dropout=self.dropout)
-
-        # 3) "Concat" using a view and apply a final linear.
-        x = x.transpose(1, 2).contiguous() \
-            .view(nbatches, -1, self.h * self.d_k)
-        return self.linears[-1](x)
-
-
-class PositionwiseFeedForward(nn.Module):
-    "Implements FFN equation."
-
-    def __init__(self, d_model, d_ff, dropout=0.1):
-        super(PositionwiseFeedForward, self).__init__()
-        self.w_1 = nn.Linear(d_model, d_ff)
-        self.norm = nn.Sequential()  # nn.BatchNorm1d(d_ff)
-        self.w_2 = nn.Linear(d_ff, d_model)
-        self.dropout = None
-
-    def forward(self, x):
-        return self.w_2(self.norm(F.relu(self.w_1(x)).transpose(2, 1).contiguous()).transpose(2, 1).contiguous())
-
-
-class PointNet(nn.Module):
-    def __init__(self, emb_dims=512, normal=True):
-        super(PointNet, self).__init__()
-        if normal:
-            self.normal_estimator = NormalEstimator()
-            self.conv1 = nn.Conv1d(6, 64, kernel_size=1, bias=False)
-        else:
-            self.normal_estimator = None
-            self.conv1 = nn.Conv1d(3, 64, kernel_size=1, bias=False)
-        self.conv2 = nn.Conv1d(64, 64, kernel_size=1, bias=False)
-        self.conv3 = nn.Conv1d(64, 64, kernel_size=1, bias=False)
-        self.conv4 = nn.Conv1d(64, 128, kernel_size=1, bias=False)
-        self.conv5 = nn.Conv1d(128, emb_dims, kernel_size=1, bias=False)
-        self.bn1 = nn.BatchNorm1d(64)
-        self.bn2 = nn.BatchNorm1d(64)
-        self.bn3 = nn.BatchNorm1d(64)
-        self.bn4 = nn.BatchNorm1d(128)
-        self.bn5 = nn.BatchNorm1d(emb_dims)
-
-    def forward(self, x):
-        normals = None
-        if self.normal_estimator is not None:
-            x = self.normal_estimator(x)
-            normals = x[:, 3:, :]
-            
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = F.relu(self.bn2(self.conv2(x)))
-        x = F.relu(self.bn3(self.conv3(x)))
-        x = F.relu(self.bn4(self.conv4(x)))
-        x = F.relu(self.bn5(self.conv5(x)))
+# ==============================================================================
+# [Legacy] PointNet Encoder & MLP Decoder
+# ==============================================================================
+class PointNet_VN_Gravity_Bayes_v2(nn.Module):
+    def __init__(self, pooling='attentive', mode='equi', stride=16):
+        super(PointNet_VN_Gravity_Bayes_v2, self).__init__()
+        self.pooling = pooling
+        self.mode = mode
+        self.feat_dim = 1024
+        self.stride = stride
+        self.normal_estimator = NormalEstimator(k=30)
+        self.p_normals = None; self.q_normals = None
         
+        if self.mode == 'equi':
+            vn_in_channels = 2
+            self.vn_fc1 = VNLinearLeakyReLU(vn_in_channels, 64, dim=4, negative_slope=0.2)
+            self.vn_fc2 = VNLinearLeakyReLU(64, 64, dim=4, negative_slope=0.2)
+            self.vn_fc3 = VNLinearLeakyReLU(64, self.feat_dim, dim=4, negative_slope=0.2)
+            self.vn_self_attn = VN_Attention(self.feat_dim)
+            self.vn_cross_gating = VN_Cross_Gating(self.feat_dim)
+            if self.pooling == 'attentive':
+                raise ValueError("Attentive pooling for 'equi' mode is not implemented.")
+            elif self.pooling == 'max':
+                self.vn_pool = VNMaxPool(self.feat_dim)
+            self.vn_invariant = VNInvariant(self.feat_dim)
+            self.vn_mu_head = nn.Sequential(VNLinearLeakyReLU(self.feat_dim, self.feat_dim, dim=3, negative_slope=0.0), VNLinear(self.feat_dim, 1))
+            self.kappa_mlp = nn.Sequential(nn.Linear(self.feat_dim * 3, 128), nn.LeakyReLU(0.2), nn.Linear(128, 64), nn.LeakyReLU(0.2), nn.Linear(64, 1), nn.Softplus())
+
+        elif self.mode == 'normal':
+            std_in_channels = 9
+            self.std_fc1 = nn.Sequential(nn.Conv1d(std_in_channels, 64, 1), nn.BatchNorm1d(64), nn.LeakyReLU(0.2))
+            self.std_fc2 = nn.Sequential(nn.Conv1d(64, 64, 1), nn.BatchNorm1d(64), nn.LeakyReLU(0.2))
+            self.std_fc3 = nn.Sequential(nn.Conv1d(64, self.feat_dim, 1), nn.BatchNorm1d(self.feat_dim), nn.LeakyReLU(0.2))
+            self.std_self_attn = nn.MultiheadAttention(embed_dim=self.feat_dim, num_heads=4, batch_first=True)
+            self.std_cross_attn = nn.MultiheadAttention(embed_dim=self.feat_dim, num_heads=4, batch_first=True)
+            if self.pooling == 'attentive':
+                self.attention_mlp = nn.Sequential(nn.Linear(self.feat_dim, 128), nn.LeakyReLU(0.2), nn.Linear(128, 1))
+            self.std_mu_head = nn.Sequential(nn.Linear(self.feat_dim, 512), nn.LeakyReLU(0.2), nn.Linear(512, 3))
+            self.kappa_mlp = nn.Sequential(nn.Linear(self.feat_dim, 128), nn.LeakyReLU(0.2), nn.Linear(128, 64), nn.LeakyReLU(0.2), nn.Linear(64, 1), nn.Softplus())
+
+    def extract_feat(self, x):
+        B, D, N = x.shape
+        if D == 3: x = self.normal_estimator(x) 
+        normals = x[:, 3:, :].contiguous() 
+        if self.mode == 'normal':
+            pos = x[:, :3, :]; n = x[:, 3:, :]   
+            n_xx = n[:, 0:1, :] * n[:, 0:1, :]; n_yy = n[:, 1:2, :] * n[:, 1:2, :]; n_zz = n[:, 2:3, :] * n[:, 2:3, :]
+            n_xy = n[:, 0:1, :] * n[:, 1:2, :]; n_xz = n[:, 0:1, :] * n[:, 2:3, :]; n_yz = n[:, 1:2, :] * n[:, 2:3, :]
+            x = torch.cat([pos, n_xx, n_yy, n_zz, n_xy, n_xz, n_yz], dim=1) 
+            x = self.std_fc1(x); x = self.std_fc2(x); x = self.std_fc3(x) 
+        elif self.mode == 'equi':
+            x = x.view(B, 2, 3, N); x = self.vn_fc1(x); x = self.vn_fc2(x); x = self.vn_fc3(x) 
         return x, normals
 
+    def process_interaction(self, f_p, f_q):
+        if self.mode == 'equi':
+            f_p = self.vn_self_attn(f_p); f_q = self.vn_self_attn(f_q)
+            f_p_out = self.vn_cross_gating(x=f_p, y=f_q); f_q_out = self.vn_cross_gating(x=f_q, y=f_p)
+        elif self.mode == 'normal':
+            p_in = f_p.permute(0, 2, 1); q_in = f_q.permute(0, 2, 1)
+            p_self, _ = self.std_self_attn(p_in, p_in, p_in); q_self, _ = self.std_self_attn(q_in, q_in, q_in)
+            p_in = p_in + p_self; q_in = q_in + q_self
+            p_cross, _ = self.std_cross_attn(query=p_in, key=q_in, value=q_in); q_cross, _ = self.std_cross_attn(query=q_in, key=p_in, value=p_in)
+            p_out = p_in + p_cross; q_out = q_in + q_cross
+            f_p_out = p_out.permute(0, 2, 1); f_q_out = q_out.permute(0, 2, 1)
+        return f_p_out, f_q_out
 
-class DGCNN(nn.Module):
-    def __init__(self, emb_dims=512):
-        super(DGCNN, self).__init__()
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=1, bias=False)
-        self.conv2 = nn.Conv2d(64, 64, kernel_size=1, bias=False)
-        self.conv3 = nn.Conv2d(64, 128, kernel_size=1, bias=False)
-        self.conv4 = nn.Conv2d(128, 256, kernel_size=1, bias=False)
-        self.conv5 = nn.Conv2d(512, emb_dims, kernel_size=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.bn2 = nn.BatchNorm2d(64)
-        self.bn3 = nn.BatchNorm2d(128)
-        self.bn4 = nn.BatchNorm2d(256)
-        self.bn5 = nn.BatchNorm2d(emb_dims)
+    def apply_pooling(self, feat):
+        if self.pooling == 'attentive':
+            if self.mode == 'equi':
+                inv_feat = self.vn_invariant_layer(feat) 
+                scores = self.attention_mlp(inv_feat.permute(0, 2, 1))
+                weights = F.softmax(scores, dim=1).permute(0, 2, 1).unsqueeze(1)
+                global_feat = torch.sum(feat * weights, dim=-1)
+            elif self.mode == 'normal':
+                scores = self.attention_mlp(feat.permute(0, 2, 1))
+                weights = F.softmax(scores, dim=1).permute(0, 2, 1)
+                global_feat = torch.sum(feat * weights, dim=-1)
+            return global_feat
+        elif self.pooling == 'mean': return torch.mean(feat, dim=-1)
+        elif self.pooling == 'max': return self.vn_pool(feat) if self.mode == 'equi' else torch.max(feat, dim=-1)[0]
+
+    def forward_head(self, g_feat):
+        if self.mode == 'equi':
+            mu = self.vn_mu_head(g_feat).mean(dim=1); mu = F.normalize(mu, p=2, dim=1)
+            g_inv = self.vn_invariant(g_feat); kappa = self.kappa_mlp(g_inv) + 1.0
+        elif self.mode == 'normal':
+            mu = self.std_mu_head(g_feat); mu = F.normalize(mu, p=2, dim=1)
+            kappa = self.kappa_mlp(g_feat) + 1.0
+        return mu, kappa
+
+    def forward(self, p, q, return_feat=False):
+        f_p, n_p = self.extract_feat(p); f_q, n_q = self.extract_feat(q)
+        self.p_normals = n_p; self.q_normals = n_q
+        stride = self.stride 
+        if self.mode == 'equi': f_p_small = f_p[:, :, :, ::stride]; f_q_small = f_q[:, :, :, ::stride]
+        else: f_p_small = f_p[:, :, ::stride]; f_q_small = f_q[:, :, ::stride]
+        
+        f_p_gated, f_q_gated = self.process_interaction(f_p_small, f_q_small)
+        g_p = self.apply_pooling(f_p_gated); g_q = self.apply_pooling(f_q_gated)
+        mu_p, kappa_p = self.forward_head(g_p); mu_q, kappa_q = self.forward_head(g_q)
+        
+        # [Interface Compatibility]
+        # Legacy model returns Global Features (B, C)
+        if return_feat: return g_p, g_q, mu_p, mu_q, kappa_p, kappa_q
+        return (mu_p, kappa_p), (mu_q, kappa_q)
+
+    def check_correspondence_validity(self, batch_idx, P_indices, Q_indices, g_p, kappa_p, g_q, kappa_q, chi2_thresh=9.0):
+        # Implementation identical to previous version
+        if self.p_normals is None or self.q_normals is None: return np.ones(len(P_indices), dtype=bool), np.zeros(len(P_indices))
+        curr_p_normals = self.p_normals[batch_idx].transpose(0, 1); curr_q_normals = self.q_normals[batch_idx].transpose(0, 1) 
+        dev = curr_p_normals.device
+        if not isinstance(P_indices, torch.Tensor): P_indices = torch.tensor(P_indices, device=dev)
+        if not isinstance(Q_indices, torch.Tensor): Q_indices = torch.tensor(Q_indices, device=dev)
+        n_p = curr_p_normals[P_indices]; n_q = curr_q_normals[Q_indices] 
+        I_p = torch.matmul(n_p, g_p); I_q = torch.matmul(n_q, g_q)
+        sin2_p = torch.clamp(1.0 - I_p**2, min=1e-6); sin2_q = torch.clamp(1.0 - I_q**2, min=1e-6)
+        base_variance = 0.01 
+        term_p = sin2_p / (kappa_p + 1e-6); term_q = sin2_q / (kappa_q + 1e-6)
+        sigma_sq_total = term_p + term_q + base_variance
+        diff = torch.abs(I_p) - torch.abs(I_q)
+        M2_score = (diff**2) / sigma_sq_total
+        return (M2_score < chi2_thresh).cpu().numpy(), M2_score.cpu().numpy()
+
+class PhysicsAttention(nn.Module):
+    def __init__(self, dim, num_heads=4):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, batch_first=True)
+        self.norm = nn.LayerNorm(dim)
+    def forward(self, query, key_value):
+        attn_out, _ = self.attn(query, key_value, key_value)
+        return self.norm(query + attn_out)
+
+class GravityVelocityDecoder(nn.Module):
+    def __init__(self, feat_dim, time_embed_dim=64, hidden_dim=512, encoder_mode='equi'):
+        super().__init__()
+        self.encoder_mode = encoder_mode
+        self.hidden_dim = hidden_dim
+        self.time_embed = TimeEmbedding(time_embed_dim)
+        input_feat_dim = feat_dim * 3 if self.encoder_mode == 'equi' else feat_dim
+        self.geom_proj = nn.Sequential(nn.Linear(input_feat_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.SiLU())
+        physics_dim = (3 * 2) + time_embed_dim 
+        self.physics_proj = nn.Sequential(nn.Linear(physics_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.SiLU())
+        self.cross_attn = PhysicsAttention(hidden_dim, num_heads=8)
+        self.head = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 6))
+        nn.init.uniform_(self.head[-1].weight, -1e-5, 1e-5)
+        nn.init.constant_(self.head[-1].bias, 0)
+
+    # [FIXED] Arguments renamed to feat_p, feat_q to match Agent interface
+    def forward(self, feat_p, feat_q, g_sample_p, g_sample_q, t):
+        # Takes Global Features (B, C) from Legacy Encoder
+        # Alias feat_p -> g_p for clarity within the method
+        g_p = feat_p
+        g_q = feat_q
+
+        B = g_p.shape[0]
+        flat_p = g_p.reshape(B, -1); flat_q = g_q.reshape(B, -1)
+        h_p = self.geom_proj(flat_p); h_q = self.geom_proj(flat_q)
+        geom_kv = torch.stack([h_p, h_q], dim=1) # (B, 2, H)
+        
+        t_emb = self.time_embed(t)
+        phys_raw = torch.cat([g_sample_p, g_sample_q, t_emb], dim=1) 
+        phys_q = self.physics_proj(phys_raw).unsqueeze(1) # (B, 1, H)
+        
+        fused_feat = self.cross_attn(query=phys_q, key_value=geom_kv).squeeze(1)
+        v_pred = self.head(fused_feat)
+        return v_pred
+
+
+# ==============================================================================
+# [New] Transformer Encoder & Decoder
+# ==============================================================================
+
+class LocalPointNetBackbone(nn.Module):
+    """
+    Backbone only: Extracts features without pooling/heads.
+    """
+    def __init__(self, feat_dim=512, mode='normal'):
+        super().__init__()
+        self.mode = mode
+        self.feat_dim = feat_dim
+        self.normal_estimator = NormalEstimator(k=30)
+        
+        if self.mode == 'equi':
+            self.vn_fc1 = VNLinearLeakyReLU(2, 64, dim=4, negative_slope=0.2)
+            self.vn_fc2 = VNLinearLeakyReLU(64, 64, dim=4, negative_slope=0.2)
+            self.vn_fc3 = VNLinearLeakyReLU(64, self.feat_dim, dim=4, negative_slope=0.2)
+        elif self.mode == 'normal':
+            std_in_channels = 9
+            self.std_fc1 = nn.Sequential(nn.Conv1d(std_in_channels, 64, 1), nn.BatchNorm1d(64), nn.LeakyReLU(0.2))
+            self.std_fc2 = nn.Sequential(nn.Conv1d(64, 64, 1), nn.BatchNorm1d(64), nn.LeakyReLU(0.2))
+            self.std_fc3 = nn.Sequential(nn.Conv1d(64, self.feat_dim, 1), nn.BatchNorm1d(self.feat_dim), nn.LeakyReLU(0.2))
 
     def forward(self, x):
-        batch_size, num_dims, num_points = x.size()
-        x = get_graph_feature(x)
-        x = F.relu(self.bn1(self.conv1(x)))
-        x1 = x.max(dim=-1, keepdim=True)[0]
-
-        x = F.relu(self.bn2(self.conv2(x)))
-        x2 = x.max(dim=-1, keepdim=True)[0]
-
-        x = F.relu(self.bn3(self.conv3(x)))
-        x3 = x.max(dim=-1, keepdim=True)[0]
-
-        x = F.relu(self.bn4(self.conv4(x)))
-        x4 = x.max(dim=-1, keepdim=True)[0]
-
-        x = torch.cat((x1, x2, x3, x4), dim=1)
-
-        x = F.relu(self.bn5(self.conv5(x))).view(batch_size, -1, num_points)
-        return x
-
-
-class MLPHead(nn.Module):
-    def __init__(self, args):
-        super(MLPHead, self).__init__()
-        emb_dims = args.emb_dims
-        self.emb_dims = emb_dims
-        self.nn = nn.Sequential(nn.Linear(emb_dims * 2, emb_dims // 2),
-                                nn.BatchNorm1d(emb_dims // 2),
-                                nn.ReLU(),
-                                nn.Linear(emb_dims // 2, emb_dims // 4),
-                                nn.BatchNorm1d(emb_dims // 4),
-                                nn.ReLU(),
-                                nn.Linear(emb_dims // 4, emb_dims // 8),
-                                nn.BatchNorm1d(emb_dims // 8),
-                                nn.ReLU())
-        self.proj_rot = nn.Linear(emb_dims // 8, 4)
-        self.proj_trans = nn.Linear(emb_dims // 8, 3)
-
-    def forward(self, *input):
-        src_embedding = input[0]
-        tgt_embedding = input[1]
-        embedding = torch.cat((src_embedding, tgt_embedding), dim=1)
-        embedding = self.nn(embedding.max(dim=-1)[0])
-        rotation = self.proj_rot(embedding)
-        rotation = rotation / torch.norm(rotation, p=2, dim=1, keepdim=True)
-        translation = self.proj_trans(embedding)
-        return quat2mat(rotation), translation
-
-
-class Identity(nn.Module):
-    def __init__(self):
-        super(Identity, self).__init__()
-
-    def forward(self, *input):
-        return input
-
-
-class Transformer(nn.Module):
-    def __init__(self, args):
-        super(Transformer, self).__init__()
-        self.emb_dims = args.emb_dims
-        self.N = args.n_blocks
-        self.dropout = args.dropout
-        self.ff_dims = args.ff_dims
-        self.n_heads = args.n_heads
-        c = copy.deepcopy
-        attn = MultiHeadedAttention(self.n_heads, self.emb_dims)
-        ff = PositionwiseFeedForward(self.emb_dims, self.ff_dims, self.dropout)
-        self.model = EncoderDecoder(Encoder(EncoderLayer(self.emb_dims, c(attn), c(ff), self.dropout), self.N),
-                                    Decoder(DecoderLayer(self.emb_dims, c(attn), c(attn), c(ff), self.dropout), self.N),
-                                    nn.Sequential(),
-                                    nn.Sequential(),
-                                    nn.Sequential())
-
-    def forward(self, *input):
-        src = input[0]
-        tgt = input[1]
-        src = src.transpose(2, 1).contiguous()
-        tgt = tgt.transpose(2, 1).contiguous()
-        tgt_embedding = self.model(src, tgt, None, None).transpose(2, 1).contiguous()
-        src_embedding = self.model(tgt, src, None, None).transpose(2, 1).contiguous()
-        return src_embedding, tgt_embedding
-
-
-class SVDHead(nn.Module):
-    def __init__(self, args):
-        super(SVDHead, self).__init__()
-        self.emb_dims = args.emb_dims
-        self.reflect = nn.Parameter(torch.eye(3), requires_grad=False)
-        self.reflect[2, 2] = -1
-
-    def forward(self, *input):
-        src_embedding = input[0]
-        tgt_embedding = input[1]
-        src = input[2]
-        tgt = input[3]
-        batch_size = src.size(0)
-
-        d_k = src_embedding.size(1)
-        scores = torch.matmul(src_embedding.transpose(2, 1).contiguous(), tgt_embedding) / math.sqrt(d_k)
-        scores = torch.softmax(scores, dim=2)
-
-        src_corr = torch.matmul(tgt, scores.transpose(2, 1).contiguous())
-
-        src_centered = src - src.mean(dim=2, keepdim=True)
-
-        src_corr_centered = src_corr - src_corr.mean(dim=2, keepdim=True)
-
-        H = torch.matmul(src_centered, src_corr_centered.transpose(2, 1).contiguous())
-
-        U, S, V = [], [], []
-        R = []
-
-        for i in range(src.size(0)):
-            u, s, v = torch.svd(H[i])
-            r = torch.matmul(v, u.transpose(1, 0).contiguous())
-            r_det = torch.det(r)
-            if r_det < 0:
-                u, s, v = torch.svd(H[i])
-                v = torch.matmul(v, self.reflect)
-                r = torch.matmul(v, u.transpose(1, 0).contiguous())
-                # r = r * self.reflect
-            R.append(r)
-
-            U.append(u)
-            S.append(s)
-            V.append(v)
-
-        self.U = torch.stack(U, dim=0)
-        self.V = torch.stack(V, dim=0)
-        self.S = torch.stack(S, dim=0)
-        R = torch.stack(R, dim=0)
-
-        t = torch.matmul(-R, src.mean(dim=2, keepdim=True)) + src_corr.mean(dim=2, keepdim=True)
+        B, D, N = x.shape
+        if D == 3: x = self.normal_estimator(x) 
+        normals = x[:, 3:, :].contiguous()
         
-        return R, t.view(batch_size, 3)    
-  
-class GravityLayer(nn.Module):
-    def __init__(self, emb_dims):
-        super(GravityLayer, self).__init__()
-        # 정보이론 관점: P와 Q의 전역 특징을 결합하여 상관관계를 학습
-        self.joint_nn = nn.Sequential(
-            nn.Linear(emb_dims * 2, emb_dims),
-            nn.BatchNorm1d(emb_dims),
-            nn.ReLU(),
-            nn.Linear(emb_dims, emb_dims // 2),
-            nn.ReLU(),
-            nn.Linear(emb_dims // 2, 8) # (mu_p, k_p, mu_q, k_q)
+        if self.mode == 'normal':
+            pos = x[:, :3, :]; n = x[:, 3:, :]
+            n_xx = n[:, 0:1, :] * n[:, 0:1, :]; n_yy = n[:, 1:2, :] * n[:, 1:2, :]; n_zz = n[:, 2:3, :] * n[:, 2:3, :]
+            n_xy = n[:, 0:1, :] * n[:, 1:2, :]; n_xz = n[:, 0:1, :] * n[:, 2:3, :]; n_yz = n[:, 1:2, :] * n[:, 2:3, :]
+            x = torch.cat([pos, n_xx, n_yy, n_zz, n_xy, n_xz, n_yz], dim=1)
+            x = self.std_fc1(x); x = self.std_fc2(x); out = self.std_fc3(x)
+        elif self.mode == 'equi':
+            x = x.view(B, 2, 3, N)
+            x = self.vn_fc1(x); x = self.vn_fc2(x); out = self.vn_fc3(x)
+        return out, normals
+
+class GravityTransformerEncoder(nn.Module):
+    """
+    [PointNet] -> [Concat P, Q] -> [Transformer Encoder] -> [Split] -> [Gravity Head]
+    Returns Sequence Features (B, N, C) for Decoder.
+    """
+    def __init__(self, input_dim=1024, hidden_dim=256, num_layers=3, num_heads=4, mode='normal', stride=4, dropout=0.1):
+        super().__init__()
+        self.mode = mode
+        self.stride = stride
+        self.feat_dim = hidden_dim # Interface dim for Decoder
+        
+        # 1. Local Feature Extractor
+        self.backbone = LocalPointNetBackbone(feat_dim=hidden_dim, mode=mode)
+        
+        # 2. Transformer Encoder (Mixing P and Q)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim, nhead=num_heads, dim_feedforward=hidden_dim * 4,
+            batch_first=True, norm_first=True, dropout=dropout
         )
-
-    def forward(self, src_emb, tgt_emb):
-        # Global Feature (B, C)
-        src_g = torch.max(src_emb, dim=-1)[0]
-        tgt_g = torch.max(tgt_emb, dim=-1)[0]
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        # Joint Inference
-        combined = torch.cat([src_g, tgt_g], dim=1)
-        out = self.joint_nn(combined) # (B, 8)
+        # 3. Gravity Prediction Head
+        self.gravity_pool = nn.AdaptiveAvgPool1d(1) 
+        
+        if self.mode == 'equi':
+            self.vn_invariant = VNInvariant(hidden_dim)
+            self.mu_head = nn.Sequential(VNLinearLeakyReLU(hidden_dim, hidden_dim, dim=3, negative_slope=0.0), VNLinear(hidden_dim, 1))
+            self.kappa_mlp = nn.Sequential(nn.Linear(hidden_dim * 3, 128), nn.LeakyReLU(0.2), nn.Linear(128, 1), nn.Softplus())
+        else:
+            self.mu_head = nn.Sequential(nn.Linear(hidden_dim, 256), nn.LeakyReLU(0.2), nn.Linear(256, 3))
+            self.kappa_mlp = nn.Sequential(nn.Linear(hidden_dim, 128), nn.LeakyReLU(0.2), nn.Linear(128, 1), nn.Softplus())
+        
+        self.p_normals = None; self.q_normals = None
 
-        # (g_p, k_p), (g_q, k_q) 형태로 반환
-        g_p = F.normalize(out[:, 0:3], p=2, dim=1)
-        k_p = F.softplus(out[:, 3:4]) + 1.0
-        g_q = F.normalize(out[:, 4:7], p=2, dim=1)
-        k_q = F.softplus(out[:, 7:8]) + 1.0
+    def forward(self, p, q, return_feat=False):
+        # 1. Extract Local Features (B, C, N)
+        f_p, n_p = self.backbone(p); f_q, n_q = self.backbone(q)
+        self.p_normals = n_p; self.q_normals = n_q
+        
+        if self.stride > 1:
+            if self.mode == 'equi': f_p = f_p[:, :, :, ::self.stride]; f_q = f_q[:, :, :, ::self.stride]
+            else: f_p = f_p[:, :, ::self.stride]; f_q = f_q[:, :, ::self.stride]
 
-        return (g_p, k_p), (g_q, k_q)
+        # 2. Early Fusion
+        B, C, N_p = f_p.shape if self.mode != 'equi' else (f_p.shape[0], f_p.shape[1], f_p.shape[3])
+        
+        if self.mode == 'equi':
+            pass 
+        
+        # (B, C, N) -> (B, N, C) for Transformer
+        h_p = f_p.permute(0, 2, 1); h_q = f_q.permute(0, 2, 1)
+        joint_feat = torch.cat([h_p, h_q], dim=1) # (B, 2N, C)
+        
+        refined_feat = self.transformer(joint_feat) 
+        h_p_out = refined_feat[:, :N_p, :]; h_q_out = refined_feat[:, N_p:, :]
+        
+        # 3. Predict Gravity
+        # (B, N, C) -> (B, C, N) -> Pool
+        g_p_vec = self.gravity_pool(h_p_out.permute(0, 2, 1)).squeeze(-1)
+        g_q_vec = self.gravity_pool(h_q_out.permute(0, 2, 1)).squeeze(-1)
+        
+        mu_p, kappa_p = self._predict_head(g_p_vec)
+        mu_q, kappa_q = self._predict_head(g_q_vec)
+        
+        # [Interface Compatibility]
+        # Returns Sequence Features (B, N, C)
+        if return_feat: return h_p_out, h_q_out, mu_p, mu_q, kappa_p, kappa_q
+        return (mu_p, kappa_p), (mu_q, kappa_q)
+    
+    def _predict_head(self, feat):
+        if self.mode == 'equi':
+            mu = self.mu_head(feat).mean(dim=1); mu = F.normalize(mu, p=2, dim=1)
+            g_inv = self.vn_invariant(feat); kappa = self.kappa_mlp(g_inv) + 1.0
+        else:
+            mu = self.mu_head(feat); mu = F.normalize(mu, p=2, dim=1)
+            kappa = self.kappa_mlp(feat) + 1.0
+        return mu, kappa
 
-class GravityAligner(nn.Module):
+    def check_correspondence_validity(self, batch_idx, P_indices, Q_indices, g_p, kappa_p, g_q, kappa_q, chi2_thresh=9.0):
+        # Implementation identical to PointNet logic
+        if self.p_normals is None or self.q_normals is None: return np.ones(len(P_indices), dtype=bool), np.zeros(len(P_indices))
+        curr_p_normals = self.p_normals[batch_idx].transpose(0, 1); curr_q_normals = self.q_normals[batch_idx].transpose(0, 1) 
+        dev = curr_p_normals.device
+        if not isinstance(P_indices, torch.Tensor): P_indices = torch.tensor(P_indices, device=dev)
+        if not isinstance(Q_indices, torch.Tensor): Q_indices = torch.tensor(Q_indices, device=dev)
+        n_p = curr_p_normals[P_indices]; n_q = curr_q_normals[Q_indices] 
+        I_p = torch.matmul(n_p, g_p); I_q = torch.matmul(n_q, g_q)
+        sin2_p = torch.clamp(1.0 - I_p**2, min=1e-6); sin2_q = torch.clamp(1.0 - I_q**2, min=1e-6)
+        base_variance = 0.01 
+        term_p = sin2_p / (kappa_p + 1e-6); term_q = sin2_q / (kappa_q + 1e-6)
+        sigma_sq_total = term_p + term_q + base_variance
+        diff = torch.abs(I_p) - torch.abs(I_q)
+        M2_score = (diff**2) / sigma_sq_total
+        return (M2_score < chi2_thresh).cpu().numpy(), M2_score.cpu().numpy()
+
+class GravityTransformerDecoder(nn.Module):
     """
-    Compute rotation R such that R @ g_src = g_tgt (both unit vectors).
-    Batch-safe, handles parallel / anti-parallel cases.
+    Standard Transformer Decoder.
+    Query: Physics (Gravity + Time)
+    Key/Value: Geometry (Sequence Features from Encoder)
     """
-    def __init__(self, eps=1e-8):
+    def __init__(self, feat_dim, time_embed_dim=64, hidden_dim=256, num_layers=4, num_heads=8, dropout=0.1):
         super().__init__()
-        self.eps = eps
+        self.hidden_dim = hidden_dim
+        self.time_embed = TimeEmbedding(time_embed_dim)
+        
+        # Encoder Feature Projection
+        self.geom_proj = nn.Linear(feat_dim, hidden_dim)
+        
+        # Physics Projection (Query)
+        physics_input_dim = 3 + 3 + time_embed_dim
+        self.physics_proj = nn.Linear(physics_input_dim, hidden_dim)
+        
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=hidden_dim, nhead=num_heads, dim_feedforward=hidden_dim * 4,
+            batch_first=True, norm_first=True, dropout=dropout
+        )
+        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.head = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 6))
+        self._init_weights()
 
-    def forward(self, g_src: torch.Tensor, g_tgt: torch.Tensor) -> torch.Tensor:
-        # g_src, g_tgt: (B, 3) assumed normalized (still normalize for safety)
-        u = F.normalize(g_src, dim=1, eps=self.eps)
-        v = F.normalize(g_tgt, dim=1, eps=self.eps)
+    def _init_weights(self):
+        for p in self.parameters():
+            if p.dim() > 1: nn.init.xavier_uniform_(p)
+        nn.init.constant_(self.head[-1].weight, 0)
+        nn.init.constant_(self.head[-1].bias, 0)
 
-        # axis = u x v
-        axis = torch.cross(u, v, dim=1)                          # (B,3)
-        axis_norm = torch.norm(axis, dim=1, keepdim=True)        # (B,1)
-        dot = torch.sum(u * v, dim=1, keepdim=True).clamp(-1.0, 1.0)  # (B,1)
+    def forward(self, feat_p, feat_q, g_sample_p, g_sample_q, t):
+        # feat_p, feat_q: (B, N, C) - Sequence Features
+        B = feat_p.shape[0]
+        
+        h_p = self.geom_proj(feat_p); h_q = self.geom_proj(feat_q)
+        memory = torch.cat([h_p, h_q], dim=1) # (B, 2N, H)
+        
+        t_emb = self.time_embed(t)
+        physics_raw = torch.cat([g_sample_p, g_sample_q, t_emb], dim=1)
+        tgt = self.physics_proj(physics_raw).unsqueeze(1) # Query (B, 1, H)
+        
+        out = self.transformer_decoder(tgt=tgt, memory=memory) # (B, 1, H)
+        out = self.norm(out).squeeze(1) 
+        v_pred = self.head(out)
+        return v_pred
 
-        # If parallel: axis ~ 0
-        parallel = (axis_norm < 1e-6)
-
-        # Rodrigues: R = I + sinθ K + (1-cosθ) K^2, where K = skew(k), k = axis/||axis||
-        k = axis / (axis_norm + self.eps)                        # (B,3)
-        theta = torch.acos(dot)                                   # (B,1)
-        sin_t = torch.sin(theta)
-        cos_t = torch.cos(theta)
-
-        K = self._skew(k)                                         # (B,3,3)
-        I = torch.eye(3, device=g_src.device, dtype=g_src.dtype).unsqueeze(0)  # (1,3,3)
-
-        R = I + sin_t.view(-1,1,1) * K + (1 - cos_t).view(-1,1,1) * (K @ K)
-
-        # Anti-parallel special handling: dot ~ -1 & axis ~ 0  => pick any orthogonal axis
-        antipar = parallel & (dot < 0.0)
-        if antipar.any():
-            # choose a basis vector not parallel to u: use e_x unless u close to e_x, else e_y
-            ex = torch.tensor([1.0, 0.0, 0.0], device=u.device, dtype=u.dtype).view(1,3).repeat(u.size(0),1)
-            ey = torch.tensor([0.0, 1.0, 0.0], device=u.device, dtype=u.dtype).view(1,3).repeat(u.size(0),1)
-
-            use_ex = (torch.abs(u[:,0:1]) < 0.9)  # if u not too aligned with x
-            basis = torch.where(use_ex, ex, ey)
-            axis2 = torch.cross(u, basis, dim=1)
-            axis2 = F.normalize(axis2, dim=1, eps=self.eps)
-            K2 = self._skew(axis2)
-            # 180deg rotation: R = I + 2 K^2 (since sinπ=0, 1-cosπ = 2)
-            R_anti = I + 2.0 * (K2 @ K2)
-            R = torch.where(antipar.view(-1,1,1), R_anti, R)
-
-        # Pure parallel (dot>0): identity
-        R = torch.where(parallel.view(-1,1,1) & (dot > 0.0).view(-1,1,1), I, R)
-        return R
-
-    @staticmethod
-    def _skew(k: torch.Tensor) -> torch.Tensor:
-        # k: (B,3)
-        B = k.size(0)
-        kx, ky, kz = k[:,0], k[:,1], k[:,2]
-        O = torch.zeros(B, device=k.device, dtype=k.dtype)
-        K = torch.stack([
-            torch.stack([O, -kz,  ky], dim=1),
-            torch.stack([kz,  O, -kx], dim=1),
-            torch.stack([-ky, kx,  O], dim=1)
-        ], dim=1)
-        return K
-
-
-class GravityHypothesisTester(nn.Module):
+# ==============================================================================
+# [Agent] Generic Gravity Flow Agent (Dependency Injection)
+# ==============================================================================
+class GravityFlowAgent(nn.Module):
     """
-    test.py의 로직을 DCP 내부에서 쓰기 위한 모듈:
-    - gravity align (P->Q frame)
-    - centroid shift
-    - NN correspondence
-    - distance gate + kappa/chi2 inclination gate
-    Returns: w_p, w_q, and optionally indices/dist for debugging.
+    Agent accepts ANY encoder and decoder that satisfies the interface.
+    Interface:
+      Encoder returns: (feat_p, feat_q, mu_p, mu_q, kappa_p, kappa_q)
+      Decoder accepts: (feat_p, feat_q, g_sample_p, g_sample_q, t)
     """
-    def __init__(self, chi2_thresh=9.0, dist_scale=3.0, eps=1e-6):
+    def __init__(self, encoder, decoder):
         super().__init__()
-        self.chi2_thresh = chi2_thresh
-        self.dist_scale = dist_scale
-        self.eps = eps
-        self.aligner = GravityAligner(eps=eps)
+        self.encoder = encoder
+        self.decoder = decoder
 
-    def forward(self, src, tgt, src_n, tgt_n, g_p, k_p, g_q, k_q, return_debug=False):
+    def reparameterize(self, mu, kappa):
         """
-        src,tgt: (B,3,N)
-        src_n,tgt_n: (B,3,N)
-        g_p,g_q: (B,3)
-        k_p,k_q: (B,1)
+        vMF Reparameterization Trick
         """
-        B, _, N = src.shape
-
-        # 1) gravity align: bring src(+normal) into tgt frame
-        R_g = self.aligner(g_p, g_q)                    # (B,3,3)
-        src_rot = torch.matmul(R_g, src)                # (B,3,N)
-        src_n_rot = torch.matmul(R_g, src_n)            # (B,3,N)
-
-        # 2) centroid shift (same as test.py)
-        t_center = tgt.mean(dim=2, keepdim=True) - src_rot.mean(dim=2, keepdim=True)   # (B,3,1)
-        src_init = src_rot + t_center
-
-        # 3) NN in aligned frame: dist matrix between src_init and tgt
-        dist_pq = self._get_dist_mat(src_init, tgt)     # (B,N,N)
-        min_pq, corr_p2q = torch.min(dist_pq, dim=2)    # (B,N)
-        min_qp, corr_q2p = torch.min(dist_pq.transpose(1,2), dim=2)  # (B,N)
-
-        # 4) distance gate (tau = dist_scale * median(nn_dist))
-        # use sqrt because dist_mat is squared distance
-        nn_d_p = torch.sqrt(min_pq.clamp_min(0.0) + self.eps)        # (B,N)
-        nn_d_q = torch.sqrt(min_qp.clamp_min(0.0) + self.eps)        # (B,N)
-
-        tau_p = self.dist_scale * nn_d_p.median(dim=1, keepdim=True).values  # (B,1)
-        tau_q = self.dist_scale * nn_d_q.median(dim=1, keepdim=True).values  # (B,1)
-
-        geom_p = (nn_d_p <= tau_p).float()   # (B,N)
-        geom_q = (nn_d_q <= tau_q).float()   # (B,N)
-
-        # 5) gather matched normals
-        tgt_n_matched_for_p = self._gather_by_index(tgt_n, corr_p2q)      # (B,3,N)
-        src_n_matched_for_q = self._gather_by_index(src_n_rot, corr_q2p)  # (B,3,N)
-
-        # 6) inclination (frame-consistent: 모두 tgt frame의 g_q로 dot)
-        # inc_p: (B,N), inc_p_ref: (B,N)
-        inc_p = torch.sum(src_n_rot * g_q.unsqueeze(2), dim=1)
-        inc_p_ref = torch.sum(tgt_n_matched_for_p * g_q.unsqueeze(2), dim=1)
-
-        inc_q = torch.sum(tgt_n * g_q.unsqueeze(2), dim=1)
-        inc_q_ref = torch.sum(src_n_matched_for_q * g_q.unsqueeze(2), dim=1)
-
-        # 7) chi2/kappa gate
-        k_eff = (k_p * k_q) / (k_p + k_q + self.eps)    # (B,1)
-        # broadcast k_eff to (B,N)
-        k_eff = k_eff.expand(-1, N)
-
-        w_p = torch.sigmoid(self.chi2_thresh - k_eff * (inc_p - inc_p_ref).pow(2)) * geom_p
-        w_q = torch.sigmoid(self.chi2_thresh - k_eff * (inc_q - inc_q_ref).pow(2)) * geom_q
-
-        w_p = w_p.unsqueeze(1)  # (B,1,N)
-        w_q = w_q.unsqueeze(1)  # (B,1,N)
-
-        if return_debug:
-            debug = {
-                "R_g": R_g,
-                "t_center": t_center,
-                "corr_p2q": corr_p2q,
-                "corr_q2p": corr_q2p,
-                "nn_d_p_median": nn_d_p.median(dim=1).values,
-                "nn_d_q_median": nn_d_q.median(dim=1).values,
-                "tau_p": tau_p.squeeze(1),
-                "tau_q": tau_q.squeeze(1),
-                "w_p_mean": w_p.mean(dim=2).squeeze(1),
-                "w_q_mean": w_q.mean(dim=2).squeeze(1),
-            }
-            return w_p, w_q, debug
-
-        return w_p, w_q
-
-    @staticmethod
-    def _get_dist_mat(src, tgt):
-        # src,tgt: (B,3,N) -> dist: (B,N,N), squared Euclidean
-        inner = -2 * torch.matmul(src.transpose(2, 1), tgt)  # (B,N,N)
-        xx = torch.sum(src**2, dim=1, keepdim=True).transpose(2, 1)  # (B,N,1)
-        yy = torch.sum(tgt**2, dim=1, keepdim=True)                  # (B,1,N)
-        return xx + inner + yy
-
-    @staticmethod
-    def _gather_by_index(x, idx):
-        """
-        x: (B,3,Nx), idx: (B,N) in [0, Nx)
-        return: (B,3,N)
-        """
-        B, C, Nx = x.shape
-        N = idx.size(1)
-        idx_exp = idx.unsqueeze(1).expand(-1, C, -1)  # (B,3,N)
-        return torch.gather(x, dim=2, index=idx_exp)
-
-
-class DCP(nn.Module):
-    def __init__(self, args):
-        super(DCP, self).__init__()
-        
-        self.emb_dims = args.emb_dims
-        self.cycle = args.cycle
-        self.chi2_thresh = getattr(args, 'chi2_thresh', 9.0)
-        self.k_samples = getattr(args, 'k_samples', 128)
-        self.hypo_tester = GravityHypothesisTester(
-                chi2_thresh=self.chi2_thresh,
-                dist_scale=getattr(args, "dist_scale", 3.0),   # test.py의 "3.0 * resolution"에 해당하는 역할
-                eps=1e-6
-)
-
-        if args.emb_nn == 'pointnet':
-            self.emb_nn = PointNet(emb_dims=self.emb_dims, normal=True)
-        elif args.emb_nn == 'dgcnn':
-            self.emb_nn = DGCNN(emb_dims=self.emb_dims)
+        if self.training:
+            eps = torch.randn_like(mu)
+            scaled_noise = eps / torch.sqrt(kappa + 1e-6)
+            z = mu + scaled_noise
+            return F.normalize(z, p=2, dim=1)
         else:
-            raise Exception('Not implemented')
+            return mu
 
-        if getattr(args, 'gravity', False):
-            self.gravity_layer = GravityLayer(self.emb_dims) 
-        else:
-            None
-            
-        if args.pointer == 'identity':
-            self.pointer = Identity()
-        elif args.pointer == 'transformer':
-            self.pointer = Transformer(args=args)
-        else:
-            raise Exception("Not implemented")
-
-        if args.head == 'mlp':
-            self.head = MLPHead(args=args)
-        elif args.head == 'svd':
-            self.head = SVDHead(args=args)
-        else:
-            raise Exception('Not implemented')
-    
-    # def _nearest_neighbor(self, src, tgt):
-    #     with torch.no_grad():
-    #             inner = -2 * torch.matmul(src.transpose(2, 1), tgt)
-    #             xx = torch.sum(src**2, dim=1, keepdim=True).transpose(2, 1)
-    #             yy = torch.sum(tgt**2, dim=1, keepdim=True)
-    #             dist_mat = xx + inner + yy
-    #             _, corr_idx = torch.min(dist_mat, dim=2) # (B, N)
-    #     return corr_idx
-    
-    def _get_dist_mat(self, src, tgt):
-        inner = -2 * torch.matmul(src.transpose(2, 1), tgt)
-        xx = torch.sum(src**2, dim=1, keepdim=True).transpose(2, 1)
-        yy = torch.sum(tgt**2, dim=1, keepdim=True)
-        return xx + inner + yy
-    
-    def _geometric_hypothesis_test(self, src, tgt, src_n, tgt_n, g_p, k_p, g_q, k_q):
-        """ 
-        양방향 기하학적 가설 검정을 수행하여 src용, tgt용 마스크를 각각 반환 
-        """
-        batch_size, _, num_points = src.size()
+    def forward(self, x, t, context_q):
+        # 1. Perception
+        # Works with both PointNet (Global Feat) and Transformer (Seq Feat)
+        # as long as the paired Decoder knows how to handle it.
+        feat_p, feat_q, mu_p, mu_q, kappa_p, kappa_q = self.encoder(
+            x, context_q, return_feat=True
+        )
         
-        # 1. 양방향 NN 인덱스 추출 (P->Q, Q->P)
-        with torch.no_grad():
-            # P to Q
-            dist_pq = self._get_dist_mat(src, tgt)
-            _, corr_p2q = torch.min(dist_pq, dim=2)
-            # Q to P
-            dist_qp = dist_pq.transpose(1, 2)
-            _, corr_q2p = torch.min(dist_qp, dim=2)
+        # 2. Sampling
+        g_sample_p = self.reparameterize(mu_p, kappa_p)
+        g_sample_q = self.reparameterize(mu_q, kappa_q)
         
-        # 2. 대응되는 법선 벡터 정렬
-        def get_matched_n(indices, target_n):
-            idx_base = torch.arange(batch_size, device=src.device).view(-1, 1) * num_points
-            flat_idx = (indices + idx_base).view(-1)
-            matched = target_n.transpose(1, 2).contiguous().view(-1, 3)[flat_idx, :]
-            return matched.view(batch_size, num_points, 3).transpose(1, 2)
-
-        src_n_matched = get_matched_n(corr_q2p, src_n) # Q의 대응점인 P의 법선
-        tgt_n_matched = get_matched_n(corr_p2q, tgt_n) # P의 대응점인 Q의 법선
-
-        # 3. 통계량 계산
-        k_eff = (k_p * k_q) / (k_p + k_q + 1e-6)
+        # 3. Action
+        v_pred = self.decoder(
+            feat_p=feat_p, 
+            feat_q=feat_q, # Passed directly to decoder (Duck Typing)
+            g_sample_p=g_sample_p, 
+            g_sample_q=g_sample_q, 
+            t=t
+        )
         
-        # Source용 마스크 (P가 Q와 얼마나 일치하는가)
-        inc_p = torch.sum(src_n * g_p.unsqueeze(2), dim=1)
-        inc_p_ref = torch.sum(tgt_n_matched * g_q.unsqueeze(2), dim=1)
-        w_p = torch.sigmoid(self.chi2_thresh - k_eff * (inc_p - inc_p_ref)**2)
+        return v_pred, (mu_p, kappa_p), (mu_q, kappa_q)
 
-        # Target용 마스크 (Q가 P와 얼마나 일치하는가)
-        inc_q = torch.sum(tgt_n * g_q.unsqueeze(2), dim=1)
-        inc_q_ref = torch.sum(src_n_matched * g_p.unsqueeze(2), dim=1)
-        w_q = torch.sigmoid(self.chi2_thresh - k_eff * (inc_q - inc_q_ref)**2)
-
-        return w_p.unsqueeze(1), w_q.unsqueeze(1)
-    
-    def forward(self, *input):
-        src = input[0]
-        tgt = input[1]
-        
-        src_embedding, src_n = self.emb_nn(src)
-        tgt_embedding, tgt_n = self.emb_nn(tgt)
-
-        if self.gravity_layer is not None:
-            (g_p, k_p), (g_q, k_q) = self.gravity_layer(src_embedding, tgt_embedding)
-            w_p, w_q = self.hypo_tester(src, tgt, src_n, tgt_n, g_p, k_p, g_q, k_q)
-
-            src_embedding = src_embedding * w_p
-            tgt_embedding = tgt_embedding * w_q
-            
-            # Inference 시에만 Top-K 샘플링 적용
-            if (not self.training) and (self.k_samples < src_embedding.size(-1)):
-                B, C, N = src_embedding.shape           # (B, C, N)
-                K = self.k_samples
-
-                # w_p, w_q: (B, 1, N)
-                _, top_k_p = torch.topk(w_p.squeeze(1), K, dim=1)  # (B, K)
-                _, top_k_q = torch.topk(w_q.squeeze(1), K, dim=1)  # (B, K)
-
-                # 1) Embedding gather: (B, C, N) -> (B, C, K)
-                idx_p_emb = top_k_p.unsqueeze(1).expand(-1, C, -1)  # (B, C, K)
-                idx_q_emb = top_k_q.unsqueeze(1).expand(-1, C, -1)  # (B, C, K)
-
-                src_embedding = torch.gather(src_embedding, dim=2, index=idx_p_emb)  # (B, C, K)
-                tgt_embedding = torch.gather(tgt_embedding, dim=2, index=idx_q_emb)  # (B, C, K)
-
-                # 2) Point gather: (B, 3, N) -> (B, 3, K)
-                idx_p_xyz = top_k_p.unsqueeze(1).expand(-1, 3, -1)  # (B, 3, K)
-                idx_q_xyz = top_k_q.unsqueeze(1).expand(-1, 3, -1)  # (B, 3, K)
-
-                src_topk = torch.gather(src, dim=2, index=idx_p_xyz)  # (B, 3, K)
-                tgt_topk = torch.gather(tgt, dim=2, index=idx_q_xyz)  # (B, 3, K)
-
-            else:
-                src_topk = src
-                tgt_topk = tgt
-                
-        # [Step 3] Pointer & Pose Head
-        src_embedding_p, tgt_embedding_p = self.pointer(src_embedding, tgt_embedding)
-        src_embedding = src_embedding + src_embedding_p
-        tgt_embedding = tgt_embedding + tgt_embedding_p
-
-        rotation_ab, translation_ab = self.head(src_embedding, tgt_embedding, src_topk, tgt_topk)
-        if self.cycle:
-            rotation_ba, translation_ba = self.head(tgt_embedding, src_embedding, tgt_topk, src_topk)
-
-        else:
-            rotation_ba = rotation_ab.transpose(2, 1).contiguous()
-            translation_ba = -torch.matmul(rotation_ba, translation_ab.unsqueeze(2)).squeeze(2)
-        
-        return rotation_ab, translation_ab, rotation_ba, translation_ba, {
-            'g_p': g_p if self.gravity_layer is not None else None,
-            'k_p': k_p if self.gravity_layer is not None else None,
-            'g_q': g_q if self.gravity_layer is not None else None,
-            'k_q': k_q if self.gravity_layer is not None else None,
-        }
-    
+# ==============================================================================
+# Main Test Block
+# ==============================================================================
 if __name__ == '__main__':
+    print("=== Modular Agent Test ===\n")
+
+    # --- Option 1: Legacy Configuration (PointNet + MLP) ---
+    print("[Config 1] Legacy: PointNet + MLP Decoder")
+    legacy_enc = PointNet_VN_Gravity_Bayes_v2(mode='normal', pooling='attentive', stride=4)
+    legacy_dec = GravityVelocityDecoder(feat_dim=1024, encoder_mode='normal')
     
-    import argparse
-    from utils.data import data_loader
-    from omegaconf import OmegaConf
-    from utils.common import count_parameters
-    from utils.loss import DCPLoss
+    agent_legacy = GravityFlowAgent(encoder=legacy_enc, decoder=legacy_dec)
     
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset', type=str, default='bunny', choices=['modelnet40', 'bunny'])
-    parser.add_argument('--bunny_path', type=str, default='data/bunny/reconstruction/bun_zipper.ply')
-    parser.add_argument('--method', type=str, default='p2p', choices=['p2p', 'p2l', 'l2l'],
-                        help='ICP method: p2p (point-to-point), p2l (point-to-plane), l2l (plane-to-plane)')
-    parser.add_argument('--max_iter', type=int, default=50, help='Maximum ICP iterations')
-    parser.add_argument('--tol', type=float, default=1e-6, help='Convergence tolerance')
-    parser.add_argument('--dist_thresh', type=float, default=0.1, help='Distance threshold for matching')
-    parser.add_argument('--emb_dims', type=int, default=512, help='Dimension of point feature embeddings')
-    parser.add_argument('--n_blocks', type=int, default=1, help='Number of Transformer blocks')
-    parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate')
-    parser.add_argument('--ff_dims', type=int, default=1024, help='Dimension of feedforward network in Transformer')
-    parser.add_argument('--n_heads', type=int, default=8, help='Number of attention heads in Transformer')
-    parser.add_argument('--emb_nn', type=str, default='pointnet', choices=['pointnet', 'dgcnn'],
-                        help='Point cloud embedding network')
-    parser.add_argument('--pointer', type=str, default='transformer', choices=['identity', 'transformer'],
-                        help='Pointer network')
-    parser.add_argument('--head', type=str, default='svd', choices=['mlp', 'svd'], help='Transformation head')
-    parser.add_argument('--cycle', action='store_true', help='Use cycle consistency')
-    parser.add_argument('--gravity', action='store_true', help='Use gravity alignment layer')
-    args = parser.parse_args()
+    # Test Legacy
+    B, N = 4, 1024
+    P = torch.randn(B, 3, N); Q = torch.randn(B, 3, N); t = torch.rand(B)
+    v, _, _ = agent_legacy(P, t, Q)
+    print(f"  Legacy Output Shape: {v.shape}") # Should be (4, 6)
+
+    print("-" * 30)
+
+    # --- Option 2: New Configuration (Transformer Encoder + Transformer Decoder) ---
+    print("[Config 2] New: Transformer Encoder + Transformer Decoder")
     
-    # Model Forward Test
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    loss_fn = DCPLoss().to(device)
-    
-    train_loader, test_loader = data_loader(
-        OmegaConf.create({
-            'data': {
-                'name': 'bunny',
-                'bunny_path': args.bunny_path,
-                'num_points': 1024,
-                'gaussian_noise': True,
-                'unseen': False,
-                'factor': 1,
-                'keep_ratio': 1.0,
-                'num_workers': 0,
-                'partial_overlap': False,
-                'distance_range': 0.1
-            },
-            'training': {
-                'batch_size': 16
-            }
-        })
+    # 1. Define Transformer Encoder
+    # Note: hidden_dim is the feature dim exchanged between encoder and decoder
+    trans_enc = GravityTransformerEncoder(
+        input_dim=1024, # PointNet Local Feat Dim
+        hidden_dim=256, 
+        num_layers=3, 
+        num_heads=4,
+        mode='normal', 
+        stride=4
     )
     
-    sample = next(iter(train_loader))
-    model = DCP(args=args).to(device)
-    print(f"Model has {count_parameters(model):,} trainable parameters")
+    # 2. Define Transformer Decoder
+    trans_dec = GravityTransformerDecoder(
+        feat_dim=256, # Must match Encoder's hidden_dim
+        hidden_dim=256,
+        num_layers=4,
+        num_heads=8
+    )
     
-     # Data Load
-    P = sample['P'].to('cuda')         
-    Q = sample['Q'].to('cuda')         
-    g_p = sample['g_p'].to('cuda') 
-    g_q = sample['g_q'].to('cuda') 
-    R_gt = sample['R_gt'].to('cuda')
-    t_gt = sample['t_gt'].to('cuda')
+    # 3. Inject into Agent
+    agent_new = GravityFlowAgent(encoder=trans_enc, decoder=trans_dec)
     
-    R_pq, t_pq, R_qp, t_qp, aux = model(P, Q)
-    loss, loss_dict = loss_fn(R_pq, t_pq, R_gt, t_gt, R_qp, t_qp, aux)
+    # Test New
+    v_new, (mu_p, k_p), (mu_q, k_q) = agent_new(P, t, Q)
     
-    print("Loss:", loss.item())
+    print(f"  New Output Shape: {v_new.shape}")
+    print(f"  Mu P Shape: {mu_p.shape}, Kappa P Shape: {k_p.shape}")
     
-    # Backward test
+    # Check Gradients
+    loss = v_new.sum() + mu_p.sum()
     loss.backward()
-    print("Backward pass successful!")
+    print("  Backward Pass Successful!")
     
+    total_params = sum(p.numel() for p in agent_new.parameters() if p.requires_grad)
+    print(f"  Total Params (New): {total_params:,}")

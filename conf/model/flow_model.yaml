@@ -1,0 +1,19 @@
+# @package model
+_target_: utils.model.GravityFlowAgent
+encoder:
+  _target_: utils.model.GravityTransformerEncoder
+  input_dim: 1024
+  hidden_dim: 256
+  num_layers: 3
+  num_heads: 4
+  mode: 'normal'
+  dropout: 0.1
+
+decoder:
+  _target_: utils.model.GravityTransformerDecoder
+  time_embed_dim: 64
+  feat_dim : ${model.encoder.hidden_dim}
+  hidden_dim: ${model.encoder.hidden_dim}
+  num_layers: 4
+  num_heads: 8
+  dropout: 0.1

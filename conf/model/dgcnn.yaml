@@ -1,0 +1,4 @@
+# @package model
+_target_: utils.model.DGCNN_VN_Gravity_Bayes
+k: 20
+normal_channel: false

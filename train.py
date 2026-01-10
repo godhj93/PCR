@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch
 from torch.utils.tensorboard import SummaryWriter
 from utils.data import data_loader
-from utils.common import train_one_epoch, AverageMeter, count_parameters, logging_tensorboard
+from utils.common import train_one_epoch, AverageMeter, count_parameters, logging_tensorboard, get_cosine_schedule_with_warmup
 from termcolor import colored
 
 log = logging.getLogger(__name__)
@@ -35,19 +35,25 @@ def train(cfg: DictConfig) -> None:
     # Load data and model
     train_loader, test_loader = data_loader(cfg)
     model = hydra.utils.instantiate(cfg.model).to(cfg.device)
-    loss_fn = hydra.utils.instantiate(cfg.loss)
-    optimizer = hydra.utils.instantiate(cfg.optim, params=model.parameters())
-    
-    if isinstance(optimizer, torch.optim.SGD):
-        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[75, 150, 225], gamma=0.1)
-    elif isinstance(optimizer, torch.optim.AdamW):
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.training.epochs)
-    else:
-        # Keep the learning rate constant if no scheduler is specified
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=cfg.training.epochs + 1, gamma=1.0)
-    
     log.info(f"Model Parameters: {count_parameters(model):,}")
+    optimizer = hydra.utils.instantiate(cfg.optim, params=model.parameters())
+    total_steps = cfg.training.epochs * len(train_loader)
+
+    warmup_ratio = 0.05 
+    num_warmup_steps = int(total_steps * warmup_ratio)
+
+    print(f"[Scheduler] Total Steps: {total_steps}, Warmup Steps: {num_warmup_steps}")
+
+    # 3. Scheduler 생성
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer, 
+        num_warmup_steps=num_warmup_steps, 
+        num_training_steps=total_steps
+    )
+    loss_fn = hydra.utils.instantiate(cfg.loss)
+    
     log.info("===== Training Start =====")
+    
     AvgMeter_train = AverageMeter()
     AvgMeter_val = AverageMeter()
     best_loss = float('inf')
@@ -67,16 +73,13 @@ def train(cfg: DictConfig) -> None:
                         cfg = cfg)
         
         
-        logging_tensorboard(writer, result, epoch, optimizer)
+        train_loss, val_loss = logging_tensorboard(writer, result, epoch, optimizer)
         
-        log.info(colored(f"Epoch [{epoch}/{cfg.training.epochs}] - "
-                        f"Train Loss: {result['train_loss']:.4f}, Test Loss: {result['val_loss']:.4f}, "
-                        f"RRE: {result['val_rre_mean']:.2f}°, RTE: {result['val_rte_mean']:.4f}, "
-                        f"LR: {optimizer.param_groups[0]['lr']:.6f}", "cyan"))
+        log.info(colored(f"Epoch [{epoch}/{cfg.training.epochs}] - Train Loss: {train_loss:.4f}, Test Loss: {val_loss:.4f}", "cyan"))
 
         # save checkpoint
-        if result['val_loss'] < best_loss:
-            best_loss = result['val_loss']
+        if val_loss < best_loss:
+            best_loss = val_loss
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),

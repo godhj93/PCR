@@ -1,7 +1,7 @@
 defaults:
   - _self_
-  - model: dcp
-  - optim: sgd
+  - model: flow_model
+  - optim: adamw
   - override hydra/job_logging: default
   - override hydra/hydra_logging: default
 
@@ -17,24 +17,31 @@ hydra:
 device: cuda:0
 
 training:
-  batch_size: 32
-  epochs: 250
+  batch_size: 64
+  epochs: 300
   
+test:
+  num_steps: 10
+  visualize: true
+  vis_every_epoch: 10
+  vis_count: 10
+
 data:
   name: modelnet40
   bunny_path: data/bunny/reconstruction/bun_zipper.ply
   num_points: 1024
-  gaussian_noise: 0.0
+  gaussian_noise: 0.01
   unseen: false
   factor: 4
   num_workers: 8
-  partial_overlap: False
-  keep_ratio: 1.0
-  distance_range: 0.5
+  partial_overlap: True
+  keep_ratio: 0.8
+  path_generator:
+    _target_: utils.path.SE3GeodesicProbPath
+    manifold: 
+      _target_: utils.se3.SE3
 
 loss:
   _target_: utils.loss.ELBOObjective
-  beta: 0.1
-
-prune:
-  ratio: 0.5
+  alpha: 1.0
+  beta: 1.0

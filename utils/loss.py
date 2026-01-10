@@ -1,7 +1,9 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
+# ==============================================================================
+# 1. Perception Loss: VMFLoss
+# ==============================================================================
 class VMFLoss(nn.Module):
     """
     Von Mises-Fisher Loss for directional prediction
@@ -42,73 +44,77 @@ class VMFLoss(nn.Module):
         
         return loss.mean()
 
-class DCPLoss(nn.Module):
-    def __init__(self, beta = 0.1, cycle = True):
-        super(DCPLoss, self).__init__()
+# ==============================================================================
+# 2. Action Loss: FlowStepLoss
+# ==============================================================================
+class FlowStepLoss(nn.Module):
+    """
+    Measures the discrepancy between predicted velocity and target geodesic velocity.
+    Equivalent to maximizing E[log p(v | z)] in ELBO.
+    """
+    def __init__(self):
+        super().__init__()
+        self.mse = nn.MSELoss()
 
-        self.beta = beta
-        self.cycle = cycle
-        
-    def forward(self, *inputs):
+    def forward(self, v_pred, v_target):
         """
-        rotation_ab_pred: (B, 3, 3) - Predicted rotation from A to B
-        translation_ab_pred: (B, 3, 1) - Predicted translation from A to B
-        rotation_ab: (B, 3, 3) - Ground Truth rotation from A to B
-        translation_ab: (B, 3, 1) - Ground Truth translation from A to B
+        Args:
+            v_pred: (B, 6) - Predicted velocity [v, w]
+            v_target: (B, 6) - Target velocity from Geodesic Path
         """
-        
-        rotation_ab_pred = inputs[0]
-        translation_ab_pred = inputs[1]
-        rotation_ab = inputs[2] # GT
-        translation_ab = inputs[3] # GT
-        rotation_ba_pred = inputs[4] 
-        translation_ba_pred = inputs[5]
-        
-        batch_size = rotation_ab_pred.shape[0]
-        identity = torch.eye(3, device=rotation_ab_pred.device).unsqueeze(0).repeat(batch_size, 1, 1)
-        
-        loss = F.mse_loss(torch.matmul(rotation_ab_pred.transpose(2, 1), rotation_ab), identity) \
-               + F.mse_loss(translation_ab_pred, translation_ab)
-        
-        assert torch.isnan(loss).sum() == 0, "Loss is NaN!"
-        
-        if self.cycle:
-            rotation_loss = F.mse_loss(torch.matmul(rotation_ba_pred, rotation_ab_pred), identity)
-            translation_loss = torch.mean((torch.matmul(rotation_ba_pred.transpose(2, 1),
-                                                        translation_ab_pred.view(batch_size, 3, 1)).view(batch_size, 3)
-                                           + translation_ba_pred) ** 2, dim=[0, 1])
-            cycle_loss = rotation_loss + translation_loss
-            assert torch.isnan(cycle_loss).sum() == 0, "Cycle Loss is NaN!"
-            loss = loss + self.beta * cycle_loss
-            
-            
-        return loss, {'loss': loss.item(), 'cycle_loss': cycle_loss.item() if self.cycle else 0.0}
-    
+        return self.mse(v_pred, v_target)
+
+# ==============================================================================
+# 3. Integrated Objective: ELBOObjective
+# ==============================================================================
 class ELBOObjective(nn.Module):
-    def __init__(self, beta):
-        super(ELBOObjective, self).__init__()
-        
+    """
+    Optimization Objective for Riemannian Flow Matching with Latent Gravity.
+    
+    Maximize ELBO <=> Minimize Loss
+    Loss = Action_Loss + beta * Perception_Loss
+    """
+    def __init__(self, alpha: float = 1.0, beta: float = 1.0):
+        super().__init__()
+        self.alpha = alpha
         self.beta = beta
+        self.perception_loss_fn = VMFLoss()
+        self.action_loss_fn = FlowStepLoss()
+
+    def forward(self, 
+                v_pred: torch.Tensor, v_target: torch.Tensor, 
+                variational_params: dict, 
+                gt_physics: dict):
+        """
+        Args:
+            v_pred: (B, 6)
+            v_target: (B, 6)
+            variational_params: {'mu_p', 'kappa_p', 'mu_q', 'kappa_q'}
+            gt_physics: {'g_p', 'g_q'}
+            
+        Returns:
+            total_loss, log_dict
+        """
+        # 1. Action Loss (Reconstruction)
+        action_loss = self.action_loss_fn(v_pred, v_target)
+
+        # 2. Perception Loss (Regularization / KL Divergence)
+        loss_g_p = self.perception_loss_fn(
+            variational_params['mu_p'], variational_params['kappa_p'], gt_physics['g_p']
+        )
+        loss_g_q = self.perception_loss_fn(
+            variational_params['mu_q'], variational_params['kappa_q'], gt_physics['g_q']
+        )
         
-        self.vmf_loss = VMFLoss()
-        self.DCPLoss = DCPLoss()   
+        perception_loss = (loss_g_p + loss_g_q) * 0.5
+
+        # 3. Total Loss (Negative ELBO)
+        total_loss = self.alpha * action_loss + self.beta * perception_loss
         
-    def forward(self, DCP, g_GT, VMF):
-        
-        dcp_loss, dcp_loss_dict = self.DCPLoss(*DCP)
-        g_p_GT, g_q_GT = g_GT
-        
-        g_p, k_p, g_q, k_q = VMF['g_p'], VMF['k_p'], VMF['g_q'], VMF['k_q']
-        vmf_loss_p = self.vmf_loss(g_p, k_p, g_p_GT)
-        vmf_loss_q = self.vmf_loss(g_q, k_q, g_q_GT)
-        
-        total_loss = dcp_loss + self.beta * (vmf_loss_p + vmf_loss_q)/2.0
-        
-        loss_dict = {
-            'dcp': dcp_loss_dict,
-            'vmf_loss': ((vmf_loss_p + vmf_loss_q)/2.0).item()
+        return total_loss, {
+            "total_loss": total_loss.item(),
+            "loss_action": action_loss.item(),
+            "loss_perception": perception_loss.item(),
+            "loss_g_p": loss_g_p.item(),
+            "loss_g_q": loss_g_q.item()
         }
-        
-        return total_loss, loss_dict
-        
-        

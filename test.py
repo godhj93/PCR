@@ -398,33 +398,22 @@ class ICPSolvers:
         
         # [Step 3] Solver 설정
         from utils.se3 import SE3
-        from utils.inference import SE3VectorField
-        from flow_matching.solver import RiemannianODESolver
-
+        from utils.inference import SE3VectorField, RiemannianEulerSolver
+        
         se3_manifold = SE3().to(device)
         
         # Vector Field에 Centered가 아닌 P_raw_tensor를 넘깁니다.
         vf = SE3VectorField(self.model, P_raw_tensor, Q_target) 
         
-        solver = RiemannianODESolver(
-           manifold=se3_manifold,
-           velocity_model = vf, 
+        solver = RiemannianEulerSolver(
+            vector_field=vf,
+            manifold=se3_manifold,
+            step_size=0.1 # t=0 -> t=1 (10 steps)
         )
         
         # [Step 4] 적분 수행 (AttributeError 방지 수정)
         # sample() 대신 sample_trajectory()를 호출하고 마지막 스텝([-1])을 가져옵니다.
-        T_init = torch.eye(4, device=device).unsqueeze(0)
-        time_grid = torch.tensor([0.0, 1.0], device=device)
-        trajectory = solver.sample(
-            x_init = T_init,
-            step_size = 0.05,
-            method = "rk4",
-            time_grid = time_grid,
-            return_intermediates = False,
-            projx = True,
-            proju = True
-         
-         )
+        trajectory = solver.sample_trajectory(T_init, t0=0.0, t1=1.0)
         T_pred = trajectory[-1] # (1, 4, 4)
         
         # [Step 5] 결과 적용
