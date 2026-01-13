@@ -62,7 +62,7 @@ class FlowStepLoss(nn.Module):
             v_pred: (B, 6) - Predicted velocity [v, w]
             v_target: (B, 6) - Target velocity from Geodesic Path
         """
-        return self.mse(v_pred, v_target)
+        return self.mse(v_pred, v_target), {'angular': v_pred[:, 3:].norm(dim=1).mean().item(), 'linear': v_pred[:, :3].norm(dim=1).mean().item()}
 
 # ==============================================================================
 # 3. Integrated Objective: ELBOObjective

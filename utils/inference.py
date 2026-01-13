@@ -109,12 +109,13 @@ class SE3VectorField(ModelWrapper):
         
         # Handle time tensor formatting
         if isinstance(t, float) or (isinstance(t, torch.Tensor) and t.ndim == 0):
-            t_tensor = torch.full((x.shape[0],), float(t), device=x.device).unsqueeze(1)
+            t_tensor = torch.full((x.shape[0],), float(t), device=x.device)
         else:
-            t_tensor = t.view(-1, 1) if t.ndim == 1 else t
+            t_tensor = t.view(-1) if t.ndim > 1 else t
             
         # Model prediction (6D velocity vector)
-        outputs = self.model(P_curr, t_tensor, self.q_tgt)
+        # Model expects: forward(p, q, t)
+        outputs = self.model(P_curr, self.q_tgt, t_tensor)
         v_pred_vec = outputs[0] if isinstance(outputs, tuple) else outputs
         
         # Convert to se(3) matrix (global frame)

@@ -123,13 +123,11 @@ def train_one_epoch(model, data_loader, optimizer, scheduler, loss_fn, epoch, me
         g_q = batch['g_q'].to(cfg.device) # (B, 3
         
         # Forward Pass
-        v_pred, (mu_p, kappa_p), (mu_q, kappa_q) = model(p_t, t, q)
+        v_pred = model(p_t, q, t)
         
         loss, log_dict = loss_fn(
             v_pred = v_pred,
-            v_target = v_target,
-            variational_params = {'mu_p': mu_p, 'kappa_p': kappa_p, 'mu_q': mu_q, 'kappa_q': kappa_q},
-            gt_physics = {'g_p': g_p, 'g_q': g_q}
+            v_target = v_target
         )
         
         optimizer.zero_grad()
@@ -141,9 +139,8 @@ def train_one_epoch(model, data_loader, optimizer, scheduler, loss_fn, epoch, me
         # Progress bar with detailed loss breakdown
         desc = (f"Epoch [{epoch}/{cfg.training.epochs}] "
                 f"Loss: {AvgMeter_train.avg:.4f} "
-                f"(Act: {log_dict['loss_action']:.4f}, "
-                f"Perc: {log_dict['loss_perception']:.4f}) "
-                f"κ: {(kappa_p.mean() + kappa_q.mean()).item() / 2:.1f}")
+                f"Angular: {log_dict['angular']:.4f}, "
+                f"Linear: {log_dict['linear']:.4f}) ")
         pbar.set_description(desc)
         
         scheduler.step()
@@ -205,13 +202,10 @@ def test_one_epoch(model, test_loader, loss_fn, metric, cfg, epoch=0, visualize=
             g_q = batch['g_q'].to(cfg.device) 
             
             # Forward Pass
-            v_pred, (mu_p, kappa_p), (mu_q, kappa_q) = model(p_t, t, q)
+            v_pred = model(p_t, q, t)
             
             loss, log_dict = loss_fn(
-                v_pred = v_pred,
-                v_target = v_target,
-                variational_params = {'mu_p': mu_p, 'kappa_p': kappa_p, 'mu_q': mu_q, 'kappa_q': kappa_q},
-                gt_physics = {'g_p': g_p, 'g_q': g_q}
+                v_pred, v_target
             )
             
             # Update Average Loss
@@ -223,17 +217,10 @@ def test_one_epoch(model, test_loader, loss_fn, metric, cfg, epoch=0, visualize=
             # -----------------------------------------------------------
             desc = (f"Val Epoch [{epoch}/{cfg.training.epochs}] "
                     f"Loss: {AvgMeter_val.avg:.4f} "
-                    f"(Act: {log_dict['loss_action']:.4f}, "
-                    f"Perc: {log_dict['loss_perception']:.4f})")
+                    f"(Angular: {log_dict['angular']:.4f}, "
+                    f"Linear: {log_dict['linear']:.4f})")
             pbar.set_description(desc)
             
-            # Visualization Data Collection
-            if visualize:
-                results['p'].append(p_t.cpu()); results['q'].append(q.cpu())
-                results['gravity_p'].append(g_p.cpu()); results['gravity_q'].append(g_q.cpu())
-                results['mu_p'].append(mu_p.cpu()); results['kappa_p'].append(kappa_p.cpu())
-                results['mu_q'].append(mu_q.cpu()); results['kappa_q'].append(kappa_q.cpu())
-    
     # -----------------------------------------------------------
     # 3. Integration on First Sample Only (After all batches)
     # -----------------------------------------------------------
@@ -315,8 +302,8 @@ def test_one_epoch(model, test_loader, loss_fn, metric, cfg, epoch=0, visualize=
             
             trajectory = solver.sample(
                 x_init=T_init,
-                step_size=0.05,
-                method="midpoint",
+                step_size=0.1,
+                method="rk4",
                 time_grid=time_grid,
                 return_intermediates=True,
                 projx=True,
@@ -383,28 +370,32 @@ def compute_errors(T_pred, T_gt):
 def logging_tensorboard(writer, result, epoch, optimizer):
     
     train_loss = result['train_loss']
-    train_loss_v_pred = result['train_loss_dict']['loss_action']
-    train_loss_g_pred = result['train_loss_dict']['loss_perception']
-    train_loss_g_p_pred = result['train_loss_dict']['loss_g_p']
-    train_loss_g_q_pred = result['train_loss_dict']['loss_g_q']
+    train_loss_angular = result['train_loss_dict']['angular']
+    train_loss_linear = result['train_loss_dict']['linear']
+    # train_loss_g_pred = result['train_loss_dict']['loss_perception']
+    # train_loss_g_p_pred = result['train_loss_dict']['loss_g_p']
+    # train_loss_g_q_pred = result['train_loss_dict']['loss_g_q']
     
     val_loss = result['val_loss']
-    val_loss_v_pred = result['val_loss_dict']['loss_action']
-    val_loss_g_pred = result['val_loss_dict']['loss_perception']
-    val_loss_g_p_pred = result['val_loss_dict']['loss_g_p']
-    val_loss_g_q_pred = result['val_loss_dict']['loss_g_q']
+    val_loss_angular = result['val_loss_dict']['angular']
+    val_loss_linear = result['val_loss_dict']['linear']
+    # val_loss_g_pred = result['val_loss_dict']['loss_perception']
+    # val_loss_g_p_pred = result['val_loss_dict']['loss_g_p']
+    # val_loss_g_q_pred = result['val_loss_dict']['loss_g_q']
     
     writer.add_scalar("Loss/train/total", train_loss, epoch)
-    writer.add_scalar("Loss/train/v_pred", train_loss_v_pred, epoch)
-    writer.add_scalar("Loss/train/g_pred", train_loss_g_pred, epoch)
-    writer.add_scalar("Loss/train/g_p_pred", train_loss_g_p_pred, epoch)
-    writer.add_scalar("Loss/train/g_q_pred", train_loss_g_q_pred, epoch)
+    writer.add_scalar("Loss/train/angular", train_loss_angular, epoch)
+    writer.add_scalar("Loss/train/linear", train_loss_linear, epoch)
+    # writer.add_scalar("Loss/train/g_pred", train_loss_g_pred, epoch)
+    # writer.add_scalar("Loss/train/g_p_pred", train_loss_g_p_pred, epoch)
+    # writer.add_scalar("Loss/train/g_q_pred", train_loss_g_q_pred, epoch)
     
     writer.add_scalar("Loss/val/total", val_loss, epoch)
-    writer.add_scalar("Loss/val/v_pred", val_loss_v_pred, epoch)
-    writer.add_scalar("Loss/val/g_pred", val_loss_g_pred, epoch)
-    writer.add_scalar("Loss/val/g_p_pred", val_loss_g_p_pred, epoch)
-    writer.add_scalar("Loss/val/g_q_pred", val_loss_g_q_pred, epoch)
+    writer.add_scalar("Loss/val/angular", val_loss_angular, epoch)
+    writer.add_scalar("Loss/val/linear", val_loss_linear, epoch)
+    # writer.add_scalar("Loss/val/g_pred", val_loss_g_pred, epoch)
+    # writer.add_scalar("Loss/val/g_p_pred", val_loss_g_p_pred, epoch)
+    # writer.add_scalar("Loss/val/g_q_pred", val_loss_g_q_pred, epoch)
     
     writer.add_scalar("Learning_Rate", optimizer.param_groups[0]['lr'], epoch)
     

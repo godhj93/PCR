@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import glob
 import h5py
+from matplotlib import animation
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -306,11 +307,14 @@ class RegistrationDataset(Dataset):
         
         t_scalar = torch.rand(1)
         
-        x_0 = torch.eye(4).unsqueeze(0)
-        x_1 = T_gt.unsqueeze(0)
+        sigma = 0.1  # 예: 0.1 ~ 0.5 수준 권장
+        xi_noise_vec = torch.randn(1, 6) * sigma  # (1, 6) [vx, vy, vz, wx, wy, wz]
+        xi_noise_mat = self.path_generator._vec2mat_se3(xi_noise_vec)  # (1, 4, 4) in se(3)
+        identity = torch.eye(4).unsqueeze(0)  # (1, 4, 4)
         
-        with torch.no_grad():
-            path_sample = self.path_generator.sample(x_0, x_1, t_scalar)
+        x_0 = self.path_generator.manifold.expmap(identity, xi_noise_mat)
+        x_1 = T_gt.unsqueeze(0)
+        path_sample = self.path_generator.sample(x_0, x_1, t_scalar)
         
         # path_sample.x_t: (1, 4, 4), path_sample.dx_t: (1, 6)
         # Squeeze batch dimension to get (4, 4) and (6,)
@@ -541,199 +545,241 @@ def draw_uncertainty_cone(ax, origin, mu_vec, kappa_val, scale=0.8, color='red')
             color=color, alpha=0.4, linewidth=2, linestyle='--')
     
 if __name__ == '__main__':
+    """
+    Flow Matching Registration Data Visualization with Animation
+    """
     import argparse
-    import sys
     
-    # ICP 모듈 임포트
-    sys.path.append(str(Path(__file__).parent.parent / 'iterative_closet_point'))
-    from iterative_closet_point.bunny import run_icp, calculatenormal, build_kdtree
+    # -------------------------------------------------------------------------
+    # 1. Setup Dataset & Path Generator
+    # -------------------------------------------------------------------------
+    from utils.se3 import SE3
+    from utils.path import SE3GeodesicProbPath
     
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset', type=str, default='bunny', choices=['modelnet40', 'bunny'])
-    parser.add_argument('--bunny_path', type=str, default='data/bunny/reconstruction/bun_zipper.ply')
-    parser.add_argument('--method', type=str, default='p2p', choices=['p2p', 'p2l', 'l2l'],
-                        help='ICP method: p2p (point-to-point), p2l (point-to-plane), l2l (plane-to-plane)')
-    parser.add_argument('--max_iter', type=int, default=50, help='Maximum ICP iterations')
-    parser.add_argument('--tol', type=float, default=1e-6, help='Convergence tolerance')
-    parser.add_argument('--dist_thresh', type=float, default=0.1, help='Distance threshold for matching')
-    args = parser.parse_args()
+    print("Setting up SE(3) path generator...")
+    manifold = SE3()
+    path_generator = SE3GeodesicProbPath(manifold)
 
-    print(f"Testing RegistrationDataset with {args.dataset}...")
-    print(f"ICP Method: {args.method}")
+    # Load bunny data
+    print("Loading Bunny data...")
+    bunny_path = 'data/bunny/reconstruction/bun_zipper.ply'
+    try:
+        bunny_data = load_bunny_data(bunny_path)
+    except FileNotFoundError:
+        print(f"Warning: Bunny file not found at {bunny_path}")
+        print("Using random data for demo...")
+        bunny_data = np.random.randn(1000, 3).astype('float32')
     
     dataset = RegistrationDataset(
-        dataset_name=args.dataset, 
-        file_path=args.bunny_path, 
-        num_points=1024, 
-        partition='test'  # test로 변경하여 일관된 결과 확인
+        dataset_name='bunny', 
+        data_source=bunny_data,
+        num_points=512,  # Reduced for faster rendering
+        partition='test',
+        path_generator=path_generator,
+        gaussian_noise=False,
+        partial_overlap=True,
+        keep_ratio=0.5
     )
     
-    print(f'Dataset size: {len(dataset)}')
-
     if len(dataset) > 0:
+        print("Dataset loaded successfully!")
+        
+        # -------------------------------------------------------------------------
+        # 2. Get One Sample from Dataset
+        # -------------------------------------------------------------------------
         sample = dataset[0]
-        print('\n=== Sample Information ===')
-        print('Sample keys:', sample.keys())
-        print('P shape:', sample['p'].shape)
-        print('Q shape:', sample['q'].shape)
-        print('R shape:', sample['R_pq'].shape)
-        print('gravity_p:', sample['gravity_p'])
-        print('gravity_q:', sample['gravity_q'])
         
-        # GT 정보
-        P = sample['p'].T  # (N, 3) for ICP
-        Q = sample['q'].T  # (N, 3) for ICP
-        R_gt = sample['R_pq']
-        t_gt = sample['t_pq']
-        corr = sample['corr_idx']
-
-        # ! Gravity consistency check
-        g_p = sample['gravity_p']
-        g_q = sample['gravity_q']
-        g_q_pred = R_gt @ g_p
-        g_err = np.linalg.norm(g_q_pred - g_q)
-        print(f'Gravity Consistency Error: {g_err:.6f}')
-
-        # GT 검증
-        print('\n=== Ground Truth Validation ===')
-        idx_p, idx_q = corr[0]
-        p_point = sample['p'][:, idx_p]
-        q_point = sample['q'][:, idx_q]
-        q_pred = R_gt @ p_point + t_gt
+        # Extract data from sample
+        P_orig = sample['p'].T.numpy()   # (N, 3) - Source point cloud (initial)
+        Q_np = sample['q'].T.numpy()     # (N, 3) - Target point cloud (static)
+        R_pq = sample['R_pq']            # (3, 3) - Ground truth rotation
+        t_pq = sample['t_pq']            # (3,) - Ground truth translation
         
-        error = np.linalg.norm(q_pred - q_point)
-        print(f"GT Transformation Error (idx {idx_p}->{idx_q}): {error:.6f}")
+        # Build ground truth transformation matrix
+        T_gt = torch.eye(4)
+        T_gt[:3, :3] = torch.from_numpy(R_pq)
+        T_gt[:3, 3] = torch.from_numpy(t_pq)
         
-        # Normals 계산 (method가 p2l 또는 l2l인 경우)
-        normals_P = None
-        normals_Q = None
-        if args.method in ['p2l', 'l2l']:
-            print("\nCalculating normals for point-to-plane/plane-to-plane ICP...")
-            normals_Q = calculatenormal(Q, k=20)
-            if args.method == 'l2l':
-                normals_P = calculatenormal(P, k=20)
+        # Generate noisy start pose (x_0)
+        sigma = 0.15
+        xi_noise_vec = torch.randn(1, 6) * sigma
+        xi_noise_mat = path_generator._vec2mat_se3(xi_noise_vec)
+        identity = torch.eye(4).unsqueeze(0)
+        x_0 = path_generator.manifold.expmap(identity, xi_noise_mat)
         
-        # ICP 실행
-        print(f'\n=== Running ICP ({args.method}) ===')
-        R_icp, t_icp, final_update = run_icp(
-            P=P,
-            Q=Q,
-            method=args.method,
-            normals_P=normals_P,
-            normals_Q=normals_Q,
-            max_iter=args.max_iter,
-            tol=args.tol,
-            dist_thresh=args.dist_thresh,
-            R_init=np.eye(3),
-            t_init=np.zeros((3, 1)),
-            verbose=True
-        )
+        # End pose (x_1) is ground truth
+        x_1 = T_gt.unsqueeze(0)
         
-        # ICP 결과와 GT 비교
-        print('\n=== ICP Results vs Ground Truth ===')
-        print('Estimated R:\n', R_icp)
-        print('Ground Truth R:\n', R_gt)
-        print('\nEstimated t:', t_icp.ravel())
-        print('Ground Truth t:', t_gt)
+        # -------------------------------------------------------------------------
+        # 3. Generate Trajectory along the Flow Matching Path
+        # -------------------------------------------------------------------------
+        num_frames = 60
+        times = torch.linspace(0, 1, num_frames)
         
-        # 회전 오차 (Frobenius norm of difference)
-        R_error = np.linalg.norm(R_icp - R_gt, 'fro')
-        print(f'\nRotation Error (Frobenius): {R_error:.6f}')
+        print(f"Generating trajectory with {num_frames} frames...")
+        trajectory_poses = []
+        velocities = []
         
-        # 회전 오차 (각도)
-        R_diff = R_icp.T @ R_gt
-        trace = np.trace(R_diff)
-        # 수치 안정성을 위해 clipping
-        trace_clamped = np.clip((trace - 1) / 2, -1.0, 1.0)
-        angle_error_rad = np.arccos(trace_clamped)
-        angle_error_deg = np.degrees(angle_error_rad)
-        print(f'Rotation Error (angle): {angle_error_deg:.4f} degrees')
+        with torch.no_grad():
+            for t_val in times:
+                t_tensor = t_val.view(1)
+                path_out = path_generator.sample(x_0, x_1, t_tensor)
+                trajectory_poses.append(path_out.x_t.squeeze(0).numpy())  # (4, 4)
+                velocities.append(path_out.dx_t.squeeze(0).numpy())  # (6,)
         
-        # 평행이동 오차
-        t_error = np.linalg.norm(t_icp.ravel() - t_gt)
-        print(f'Translation Error (L2): {t_error:.6f}')
+        trajectory_poses = np.array(trajectory_poses)
+        velocities = np.array(velocities)
         
-        # 포인트별 평균 오차 계산
-        P_transformed_gt = (R_gt @ sample['p'] + t_gt[:, None]).T  # (N, 3)
-        P_transformed_icp = (R_icp @ sample['p'] + t_icp.ravel()[:, None]).T  # (N, 3)
+        # -------------------------------------------------------------------------
+        # 4. Create Animated Visualization
+        # -------------------------------------------------------------------------
+        print("Creating animation...")
         
-        point_errors = np.linalg.norm(P_transformed_icp - P_transformed_gt, axis=1)
-        mean_point_error = np.mean(point_errors)
-        max_point_error = np.max(point_errors)
-        print(f'\nMean Point Error: {mean_point_error:.6f}')
-        print(f'Max Point Error: {max_point_error:.6f}')
+        fig = plt.figure(figsize=(16, 6))
         
-        # 시각화
-        print("\n=== Visualizations ===")
-        print("1. Ground Truth Registration")
-        visualize_registration(sample['p'], sample['q'], R_gt, t_gt, vis=False,
-                             title=f"{args.dataset} - Ground Truth Registration")
-        
-        print("2. ICP Registration")
-        visualize_registration(sample['p'], sample['q'], R_icp, t_icp.ravel(), vis=False, 
-                             title=f"{args.dataset} - ICP ({args.method}) Registration")
-        
-        # --- 시각화 및 저장 (GUI 없음) ---
-        print("\n=== Generating Visualization (No GUI) ===")
-        
-        fig = plt.figure(figsize=(18, 10))
-        
-        # 화살표 시작점 (점군의 중심)
-        center_p = np.mean(sample['p'], axis=1)
-        center_q = np.mean(sample['q'], axis=1)
-        
-        # [1] Before Registration
+        # 3D Trajectory Plot
         ax1 = fig.add_subplot(131, projection='3d')
-        # 점들을 좀 더 흐리게(alpha=0.3) 하고 작게(s=1) 해서 화살표 강조
-        ax1.scatter(sample['p'][0], sample['p'][1], sample['p'][2], c='blue', s=1, alpha=0.3, label='Source (P)')
-        ax1.scatter(sample['q'][0], sample['q'][1], sample['q'][2], c='red', s=1, alpha=0.3, label='Target (Q)')
         
-        # P는 검은색, Q는 빨간색 화살표 (대비 강조)
-        draw_gravity_arrow(ax1, center_p, sample['gravity_p'], 'black', 'g_P')
-        draw_gravity_arrow(ax1, center_q, sample['gravity_q'], 'red', 'g_Q')
+        # Static Target Cloud (Red)
+        ax1.scatter(Q_np[:, 0], Q_np[:, 1], Q_np[:, 2], 
+                   c='red', s=3, alpha=0.3, label='Target (Q)', zorder=1)
         
-        ax1.set_title("1. Before Registration")
-        ax1.legend()
+        # Dynamic Source Cloud (Blue)
+        scatter_p = ax1.scatter([], [], [], c='blue', s=5, alpha=0.7, 
+                               label='Source (P)', zorder=5)
         
-        # [2] GT Alignment
-        ax2 = fig.add_subplot(132, projection='3d')
-        P_gt_vis = (R_gt @ sample['p'] + t_gt[:, None])
-        center_p_gt = np.mean(P_gt_vis, axis=1)
-        g_p_aligned_gt = R_gt @ sample['gravity_p']
+        ax1.set_xlim([-2, 2])
+        ax1.set_ylim([-2, 2])
+        ax1.set_zlim([-2, 2])
+        ax1.set_xlabel('X', fontsize=10)
+        ax1.set_ylabel('Y', fontsize=10)
+        ax1.set_zlabel('Z', fontsize=10)
+        ax1.set_title('Flow Matching Path: P(t) → Q', fontsize=12, fontweight='bold')
+        ax1.legend(loc='upper left')
+        ax1.grid(True, alpha=0.3)
         
-        ax2.scatter(P_gt_vis[0], P_gt_vis[1], P_gt_vis[2], c='green', s=1, alpha=0.3, label='P (GT)')
-        ax2.scatter(sample['q'][0], sample['q'][1], sample['q'][2], c='red', s=1, alpha=0.3, label='Q')
+        # Translation trajectory over time
+        ax2 = fig.add_subplot(132)
+        translations = trajectory_poses[:, :3, 3]  # (num_frames, 3)
+        ax2.plot(times.numpy(), translations[:, 0], 'r-', linewidth=2, alpha=0.3, label='X')
+        ax2.plot(times.numpy(), translations[:, 1], 'g-', linewidth=2, alpha=0.3, label='Y')
+        ax2.plot(times.numpy(), translations[:, 2], 'b-', linewidth=2, alpha=0.3, label='Z')
         
-        draw_gravity_arrow(ax2, center_p_gt, g_p_aligned_gt, 'green', 'g_P(GT)')
-        draw_gravity_arrow(ax2, center_q, sample['gravity_q'], 'red', 'g_Q')
+        trans_marker, = ax2.plot([], [], 'ko', markersize=8)
+        trans_vline = ax2.axvline(x=0, color='k', linestyle='--', linewidth=2, alpha=0.5)
         
-        ax2.set_title("2. GT Registration")
+        ax2.set_xlabel('Time t', fontsize=10)
+        ax2.set_ylabel('Translation', fontsize=10)
+        ax2.set_title('Translation Components', fontsize=12, fontweight='bold')
         ax2.legend()
+        ax2.grid(True, alpha=0.3)
         
-        # [3] ICP Alignment
-        ax3 = fig.add_subplot(133, projection='3d')
-        P_icp_vis = (R_icp @ sample['p'] + t_icp.ravel()[:, None])
-        center_p_icp = np.mean(P_icp_vis, axis=1)
-        g_p_aligned_icp = R_icp @ sample['gravity_p']
+        # Velocity over time
+        ax3 = fig.add_subplot(133)
+        ax3.plot(times.numpy(), velocities[:, 0], 'r-', linewidth=2, alpha=0.3, label='v_x')
+        ax3.plot(times.numpy(), velocities[:, 1], 'g-', linewidth=2, alpha=0.3, label='v_y')
+        ax3.plot(times.numpy(), velocities[:, 2], 'b-', linewidth=2, alpha=0.3, label='v_z')
+        ax3.plot(times.numpy(), velocities[:, 3], 'r--', linewidth=2, alpha=0.3, label='ω_x')
+        ax3.plot(times.numpy(), velocities[:, 4], 'g--', linewidth=2, alpha=0.3, label='ω_y')
+        ax3.plot(times.numpy(), velocities[:, 5], 'b--', linewidth=2, alpha=0.3, label='ω_z')
         
-        ax3.scatter(P_icp_vis[0], P_icp_vis[1], P_icp_vis[2], c='cyan', s=1, alpha=0.3, label='P (ICP)')
-        ax3.scatter(sample['q'][0], sample['q'][1], sample['q'][2], c='red', s=1, alpha=0.3, label='Q')
+        vel_vline = ax3.axvline(x=0, color='k', linestyle='--', linewidth=2, alpha=0.5)
         
-        draw_gravity_arrow(ax3, center_p_icp, g_p_aligned_icp, 'cyan', 'g_P(ICP)')
-        draw_gravity_arrow(ax3, center_q, sample['gravity_q'], 'red', 'g_Q')
+        ax3.set_xlabel('Time t', fontsize=10)
+        ax3.set_ylabel('Velocity', fontsize=10)
+        ax3.set_title('Velocity (6D: linear + angular)', fontsize=12, fontweight='bold')
+        ax3.legend(fontsize=8)
+        ax3.grid(True, alpha=0.3)
         
-        ax3.set_title(f"3. ICP Registration ({args.method})")
-        ax3.legend()
+        # Time text
+        time_text = fig.text(0.5, 0.95, '', ha='center', fontsize=14, fontweight='bold')
         
-        # 저장
-        save_path = f'runs/icp_vis_gravity_{args.dataset}_{args.method}.png'
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.tight_layout(rect=[0, 0, 1, 0.93])
         
-        plt.tight_layout()
-        # plt.show()
-        plt.savefig(save_path, dpi=150) # 해상도 높임
-        print(f"Visualization saved to: {save_path}")
-        plt.close(fig) # 메모리 해제
+        # Store quiver objects as list to update them
+        quivers = []
 
+        def init():
+            scatter_p._offsets3d = ([], [], [])
+            time_text.set_text('')
+            return scatter_p, time_text
+
+        def update(frame_idx):
+            # Get current transformation
+            T_current = trajectory_poses[frame_idx]  # (4, 4)
+            R_curr = T_current[:3, :3]
+            t_curr = T_current[:3, 3]
+            
+            # Transform point cloud: P_t = P_orig @ R^T + t
+            P_transformed = P_orig @ R_curr.T + t_curr
+            
+            # Update scatter plot
+            scatter_p._offsets3d = (P_transformed[:, 0], 
+                                   P_transformed[:, 1], 
+                                   P_transformed[:, 2])
+            
+            # Remove old quivers safely
+            for q in quivers:
+                try:
+                    q.remove()
+                except:
+                    pass
+            quivers.clear()
+            
+            # Draw coordinate frame at current pose
+            scale = 0.4
+            origin = t_curr
+            
+            q_x = ax1.quiver(origin[0], origin[1], origin[2],
+                            R_curr[0, 0], R_curr[1, 0], R_curr[2, 0],
+                            color='red', arrow_length_ratio=0.3, 
+                            linewidth=2, length=scale)
+            q_y = ax1.quiver(origin[0], origin[1], origin[2],
+                            R_curr[0, 1], R_curr[1, 1], R_curr[2, 1],
+                            color='green', arrow_length_ratio=0.3, 
+                            linewidth=2, length=scale)
+            q_z = ax1.quiver(origin[0], origin[1], origin[2],
+                            R_curr[0, 2], R_curr[1, 2], R_curr[2, 2],
+                            color='blue', arrow_length_ratio=0.3, 
+                            linewidth=2, length=scale)
+            
+            quivers.extend([q_x, q_y, q_z])
+            
+            # Update time markers
+            t_val = times[frame_idx].item()
+            trans_marker.set_data([t_val], [0])
+            trans_vline.set_xdata([t_val, t_val])
+            vel_vline.set_xdata([t_val, t_val])
+            
+            # Update time text
+            time_text.set_text(f'Time: t = {t_val:.3f}')
+
+        ani = animation.FuncAnimation(fig, update, frames=num_frames, 
+                                     init_func=init, interval=50, 
+                                     blit=False, repeat=True)
+        
+        # Save Animation
+        save_path = 'flow_matching_registration.gif'
+        os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else '.', exist_ok=True)
+        
+        print(f"Saving animation to {save_path}...")
+        try:
+            from matplotlib.animation import PillowWriter
+            writer = PillowWriter(fps=20)
+            ani.save(save_path, writer=writer)
+            print(f"✓ Animation saved successfully: {save_path}")
+            print("You can view it with an image viewer or browser.")
+        except Exception as e:
+            print(f"Warning: Could not save animation: {e}")
+            print("Displaying animation in window instead...")
+        
+        plt.show()
+        
+        # Print info
+        print(f"\n{'='*60}")
+        print(f"Initial Pose (x_0):\n{x_0.squeeze(0).numpy()}")
+        print(f"\nGround Truth Pose (x_1):\n{x_1.squeeze(0).numpy()}")
+        print(f"{'='*60}")
+            
     else:
-        print("Dataset is empty.")
+        print("Error: Dataset is empty.")
