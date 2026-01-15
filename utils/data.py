@@ -74,20 +74,18 @@ def jitter_pointcloud(pointcloud: np.ndarray, sigma: float = 0.01, clip: float =
     N, C = pointcloud.shape
     pointcloud = pointcloud + np.clip(sigma * np.random.randn(N, C), -clip, clip)
     return pointcloud
-
 class RegistrationDataset(Dataset):
     def __init__(self, 
                  dataset_name: str,
-                 data_source = None,  # 외부에서 로드된 데이터를 받음 (공유)
-                 file_path: Optional[str] = None,  # Bunny 파일 경로 (backward compatibility)
+                 data_source = None,  # 외부에서 로드된 데이터 (ModelNet40 or Bunny points)
                  num_points: int = 1024, 
                  partition: str = 'train', 
                  gaussian_noise: bool = False, 
                  unseen: bool = False, 
-                 factor: float = 1,
+                 factor: float = 4,   # 회전 범위 조절 인자
                  partial_overlap: bool = True,
-                 keep_ratio: float = 0.1,
-                 distance_range: float = 10.0):
+                 keep_ratio: float = 0.7,
+                 distance_range: float = 0.5):
         
         self.dataset_name = dataset_name.lower()
         self.num_points = num_points
@@ -98,13 +96,12 @@ class RegistrationDataset(Dataset):
         self.partial_overlap = partial_overlap 
         self.keep_ratio = keep_ratio    
         self.distance_range = distance_range
-        # ! Gravity 설정 (World frame에서의 중력 방향)
-        # ! 여기서는 z-축 음의 방향을 "중력"으로 정의 (예: g_world = (0, 0, -1))
-        # ! 실제 로봇/센서 설정에 맞춰 이 벡터를 바꾸면 됨.
+        
+        # ! Gravity 설정 (World frame: y-axis down assumption for ModelNet/Bunny usually)
+        # 상황에 따라 (0, 0, -1) 등으로 변경 가능
+        self.gravity_world = np.array([0.0, -1.0, 0.0], dtype='float32')
         
         if self.dataset_name == 'modelnet40':
-            self.gravity_world = np.array([0.0, -1.0, 0.0], dtype='float32')
-            
             self.data, self.label = data_source
             self.label = self.label.squeeze()
             
@@ -118,18 +115,13 @@ class RegistrationDataset(Dataset):
                     self.label = self.label[self.label < 20]
                     
         elif self.dataset_name == 'bunny':
-            self.gravity_world = np.array([0.0, -1.0, 0.0], dtype='float32')
-            
             self.bunny_points = data_source
             assert self.bunny_points is not None, "Bunny points data must be provided."
-            # Bunny는 단일 객체이므로 Dataset 길이를 가상으로 설정
             self.virtual_size = 10000 if partition == 'train' else 1000
-            print(f"Bunny dataset virtual size set to {self.virtual_size} for partition '{self.partition}'")
         else:
             raise ValueError(f"Unknown dataset name: {dataset_name}")
 
     def _generate_rotation(self, seed_idx=None):
-        
         if self.partition != 'train' and seed_idx is not None:
             np.random.seed(seed_idx)
         
@@ -149,86 +141,82 @@ class RegistrationDataset(Dataset):
                        [-siny, 0, cosy]])
         
         Rz = np.array([[cosz, -sinz, 0],
-                          [sinz, cosz, 0],
-                          [0, 0, 1]])
+                       [sinz, cosz, 0],
+                       [0, 0, 1]])
         
-        # Euler angle: Rx -> Ry -> Rz 순서로 회전 적용
         R = Rx.dot(Ry).dot(Rz)
-        
-        euler = np.array([anglez, angley, anglex])  # ZYX 순서
-        
-        return R.astype('float32'), euler.astype('float32')
+        return R.astype('float32')
       
     def _partial_crop(self, points, seed_idx=None):
         """
-        Helper: Randomly crop the point cloud by a plane and resample.
-        Keep Ratio: 10% ~ 100% (Cropped 0% ~ 90%)
+        [수정됨] 점군을 자르고 리샘플링할 때, '원본 인덱스'도 함께 추적하여 반환함.
+        Returns:
+            resampled_points: (N, 3)
+            resampled_indices: (N,) - 각 점이 원본 데이터의 몇 번째 점이었는지
         """
-        if not self.partial_overlap:
-            return points
-
         if self.partition != 'train' and seed_idx is not None:
             np.random.seed(seed_idx)
             
-        # 1. 랜덤 방향 벡터 생성
+        # 1. 원본 인덱스 배열 (0 ~ Total_N-1)
+        original_indices = np.arange(len(points))
+            
+        # 2. 랜덤 방향으로 자르기
         rand_dir = np.random.randn(3)
         rand_dir /= np.linalg.norm(rand_dir)
         
-        # 2. 투영 및 정렬
         proj = points @ rand_dir
         sort_idx = np.argsort(proj)
         
-        # 3. 유지할 비율 결정 (0.1 ~ 1.0) -> 즉 0~90% 잘려나감
-        
+        # 3. 유지할 비율 결정
         keep_ratio = np.random.uniform(self.keep_ratio, 1.0)
         num_keep = int(len(points) * keep_ratio)
         
         # 4. Slicing
         keep_idx = sort_idx[:num_keep]
         cropped_points = points[keep_idx]
+        cropped_indices = original_indices[keep_idx] # <--- 인덱스도 같이 자름
         
-        # 5. Resampling (배치 처리를 위해 원래 점 개수로 복원)
+        # 5. Resampling (배치 크기 맞추기)
         if len(cropped_points) < self.num_points:
-            
             if self.partition != 'train' and seed_idx is not None:
-                # 같은 seed_idx를 쓰면 위쪽 패턴과 동기화되어 편향될 수 있으므로 +1을 해줍니다.
-                np.random.seed(seed_idx + 1) 
+                np.random.seed(seed_idx + 1)
 
+            # 중복 허용 샘플링
             choice_idx = np.random.choice(len(cropped_points), self.num_points, replace=True)
             resampled_points = cropped_points[choice_idx]
+            resampled_indices = cropped_indices[choice_idx] # <--- 인덱스 추적
             
-            # 중복 샘플링된 점들을 구별하기 위한 jitter (SVD 안정성)
-            jitter = np.random.normal(scale=0.02, size=resampled_points.shape)
+            # 중복 점 구분을 위한 미세한 Jitter
+            jitter = np.random.normal(scale=0.001, size=resampled_points.shape)
             resampled_points = resampled_points + jitter.astype('float32')
             
         else:
             if self.partition != 'train' and seed_idx is not None:
-                np.random.seed(seed_idx + 2) # 다른 값으로 시드 고정
+                np.random.seed(seed_idx + 2)
 
             choice_idx = np.random.choice(len(cropped_points), self.num_points, replace=False)
             resampled_points = cropped_points[choice_idx]
+            resampled_indices = cropped_indices[choice_idx] # <--- 인덱스 추적
             
-        return resampled_points
+        return resampled_points, resampled_indices
         
     def __getitem__(self, item):
         # ---------------------------------------------------------------------
-        # 1. Point Cloud 데이터 가져오기 (기존 동일)
+        # 1. Load Data
         # ---------------------------------------------------------------------
         if self.dataset_name == 'modelnet40':
             pointcloud = self.data[item][:self.num_points]
-            
         elif self.dataset_name == 'bunny':
             total_pts = self.bunny_points.shape[0]
-            
             if self.partition == 'train':
                 idx = np.random.choice(total_pts, self.num_points, replace=False)
             else:
                 np.random.seed(item) 
                 idx = np.random.choice(total_pts, self.num_points, replace=False)
             pointcloud = self.bunny_points[idx]
-
+        
         # ---------------------------------------------------------------------
-        # 2. Normalization (기존 동일)
+        # 2. Normalize
         # ---------------------------------------------------------------------
         centroid = np.mean(pointcloud, axis=0)
         pointcloud = pointcloud - centroid
@@ -238,79 +226,115 @@ class RegistrationDataset(Dataset):
         p_canonical = pointcloud.copy()
         
         # ---------------------------------------------------------------------
-        # 3. Augmentation (기존 동일)
+        # 3. Augmentation & Registration Setup
         # ---------------------------------------------------------------------
+        # Seeds for reproducibility in validation/test
         seed_p = item + 100000 if self.partition != 'train' else None
         seed_q = item if self.partition != 'train' else None
         seed_crop_p = item + 200000 if self.partition != 'train' else None
         seed_crop_q = item + 300000 if self.partition != 'train' else None
         
-        R_src, _ = self._generate_rotation(seed_p)
-        R_ab, euler_ab = self._generate_rotation(seed_q)
-        R_ba = R_ab.T
+        # Rotations
+        R_src = self._generate_rotation(seed_p)        # P의 초기 포즈용
+        R_ab = self._generate_rotation(seed_q)         # P -> Q 회전 (GT)
         
+        # Translation
         if self.partition != 'train':
             np.random.seed(item)
         dist = self.distance_range
-        translation_ab = np.array([
-            np.random.uniform(-dist, dist),
-            np.random.uniform(-dist, dist),
-            np.random.uniform(-dist, dist)
-        ], dtype='float32')
+        translation_ab = np.random.uniform(-dist, dist, size=3).astype('float32')
         
-        # translation_ba = -R_ba.dot(translation_ab)
+        # ---------------------------------------------------------------------
+        # 4. Partial Overlap Logic (수정된 부분)
+        # ---------------------------------------------------------------------
+        matches = -1 * np.ones(self.num_points, dtype='int64') # (N,) Default -1 (Outlier)
         
         if self.partial_overlap:
-            P_crop = self._partial_crop(p_canonical, seed_crop_p)
+            # P 생성
+            P_crop, P_indices = self._partial_crop(p_canonical, seed_crop_p)
             P0 = (R_src @ P_crop.T).T
             
-            Q_crop = self._partial_crop(p_canonical, seed_crop_q)
+            # Q 생성
+            Q_crop, Q_indices = self._partial_crop(p_canonical, seed_crop_q)
             Q0_base = (R_src @ Q_crop.T).T
             Q0 = (R_ab @ Q0_base.T).T + translation_ab[None, :]
             
-            corr = np.zeros((self.num_points, 2), dtype='int64')
-        
+            # --- Correspondence Matching (Intersection) ---
+            # P_indices[i] : P의 i번째 점의 원본 인덱스
+            # Q_indices[j] : Q의 j번째 점의 원본 인덱스
+            # 목표: P[i]와 원본 인덱스가 같은 Q[j]를 찾아 matches[i] = j 기록
+            
+            # Q 인덱스 룩업 테이블 생성 {원본idx : Q내부idx}
+            # replace=True로 인해 중복된 경우, 마지막 인덱스를 덮어쓰거나 첫번째를 씀.
+            # 여기서는 간단히 dict생성 (중복 시 뒤의 것이 저장됨)
+            q_lookup = {orig_idx: q_pos for q_pos, orig_idx in enumerate(Q_indices)}
+            
+            # P를 순회하며 매칭 찾기
+            for p_pos, orig_idx in enumerate(P_indices):
+                if orig_idx in q_lookup:
+                    matches[p_pos] = q_lookup[orig_idx]
+            
+            # Sparse Correspondence (N_valid, 2)
+            valid_p_idx = np.where(matches != -1)[0]
+            valid_q_idx = matches[valid_p_idx]
+            corr = np.stack([valid_p_idx, valid_q_idx], axis=1).astype('int64')
+            
         else:
+            # Full Overlap Logic (기존과 유사하지만 matches 배열 생성 추가)
             P0 = (R_src @ p_canonical.T).T
             Q0 = (R_ab @ P0.T).T + translation_ab[None, :]
             
-            N = self.num_points
-            perm_p = np.random.permutation(N)
-            perm_q = np.random.permutation(N)
+            perm_p = np.random.permutation(self.num_points)
+            perm_q = np.random.permutation(self.num_points)
             
             P0 = P0[perm_p]
             Q0 = Q0[perm_q]
             
+            # P0는 원본의 perm_p[i] 번째 점
+            # Q0는 원본의 perm_q[j] 번째 점
+            
+            # 역매핑: 원본 점 k는 P의 어디에 있는가? -> inv_perm_p[k]
             inv_perm_p = np.argsort(perm_p)
             inv_perm_q = np.argsort(perm_q)
-            corr = np.stack([inv_perm_p, inv_perm_q], axis=1).astype('int64')
+            
+            # P의 i번째 점은 원본의 perm_p[i] 점임.
+            # 원본의 perm_p[i] 점은 Q의 inv_perm_q[perm_p[i]] 에 있음.
+            matches = inv_perm_q[perm_p]
+            
+            # Sparse corr (여기선 전체가 매칭됨)
+            corr = np.stack([np.arange(self.num_points), matches], axis=1).astype('int64')
 
-        # Gravity Vectors
+        # ---------------------------------------------------------------------
+        # 5. Gravity & Noise & Returns
+        # ---------------------------------------------------------------------
+        # Gravity Vectors (World frame -> Body frame)
         g_p = (R_src @ self.gravity_world).astype('float32')
         g_q = (R_ab @ g_p).astype('float32')
 
-        # Noise
         if self.gaussian_noise:
             P0 = jitter_pointcloud(P0)
             Q0 = jitter_pointcloud(Q0)
         
         return_dict = {
-            # === Inputs (All 3xN, Contiguous) ===
-            'P': torch.from_numpy(P0).transpose(0, 1).contiguous().to(torch.float32),       # (3, N)
-            'Q': torch.from_numpy(Q0).transpose(0, 1).contiguous().to(torch.float32),       # (3, N)
+            # Point Clouds
+            'P': torch.from_numpy(P0).transpose(0, 1).contiguous().to(torch.float32), # (3, N)
+            'Q': torch.from_numpy(Q0).transpose(0, 1).contiguous().to(torch.float32), # (3, N)
             
-            # === Labels ===
-            'g_p': torch.from_numpy(g_p).to(torch.float32),                               # (3,)
-            'g_q': torch.from_numpy(g_q).to(torch.float32),                               # (3,)
+            # Gravity
+            'g_p': torch.from_numpy(g_p).to(torch.float32), # (3,)
+            'g_q': torch.from_numpy(g_q).to(torch.float32), # (3,)
             
-            # === Metadata ===
+            # Ground Truth Transformation
             'R_gt': torch.from_numpy(R_ab).to(torch.float32),         
             't_gt': torch.from_numpy(translation_ab).to(torch.float32),
-            'corr_idx': corr,
+            
+            # Correspondences
+            'corr_idx': corr,                         # (K, 2) : 유효한 매칭 쌍의 인덱스 리스트
+            'matches': torch.from_numpy(matches).long() # (N,) : P의 각 점에 대한 Q의 인덱스 (-1은 Outlier)
         }
 
         return return_dict
-        
+
     def __len__(self):
         if self.dataset_name == 'modelnet40':
             return self.data.shape[0]

@@ -72,8 +72,11 @@ def train_one_epoch(model, data_loader, optimizer, scheduler, loss_fn, epoch, me
         t_gt = batch['t_gt'].to(cfg.device)
         
         # Forward Pass
-        R_pq, t_pq, R_qp, t_qp, gravity = model(P, Q)
-        loss, loss_dict = loss_fn((R_pq, t_pq, R_gt, t_gt, R_qp, t_qp), (g_p, g_q), gravity)
+        (mu_p, k_p), (mu_q, k_q) = model(P, Q)
+        loss = loss_fn(mu_p, k_p, g_p)
+        loss += loss_fn(mu_q, k_q, g_q)
+        loss /= 2.0
+        
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -82,7 +85,7 @@ def train_one_epoch(model, data_loader, optimizer, scheduler, loss_fn, epoch, me
         
         # Progress bar with detailed loss breakdown
         desc = (f"Epoch [{epoch}/{cfg.training.epochs}] "
-                f"Loss Avg: {AvgMeter_train.avg:.4f} (Loss: {loss_dict['dcp']['loss']:.4f} | Cycle: {loss_dict['dcp']['cycle_loss']:.4f} | VMF: {loss_dict['vmf_loss']:.4f}) "
+                f"Loss Avg: {AvgMeter_train.avg:.4f} (k_p: {k_p.mean().item():.2f}, k_q: {k_q.mean().item():.2f}) | "
                 f"LR: {optimizer.param_groups[0]['lr']:.6f}")
 
         pbar.set_description(desc)
@@ -102,10 +105,6 @@ def test_one_epoch(model, test_loader, loss_fn, metric, cfg, epoch=0):
     model.eval()
     AvgMeter_val = metric['val']
     
-    # Additional metrics for RRE and RTE
-    rre_list = []
-    rte_list = []
-    
     pbar = tqdm(test_loader, ncols=0, leave = False)
     
     with torch.no_grad():
@@ -119,46 +118,28 @@ def test_one_epoch(model, test_loader, loss_fn, metric, cfg, epoch=0):
             t_gt = batch['t_gt'].to(cfg.device)   
             
             # Forward Pass
-            R_pq, t_pq, R_qp, t_qp, gravity = model(P, Q)
-            loss, loss_dict = loss_fn((R_pq, t_pq, R_gt, t_gt, R_qp, t_qp), (g_p, g_q), gravity)
-            
-            # Compute RRE and RTE
-            rre = compute_rotation_error(R_pq, R_gt)  # (B,) degrees
-            rte = compute_translation_error(t_pq, t_gt)  # (B,)
-            
-            rre_list.append(rre.cpu())
-            rte_list.append(rte.cpu())
+            (mu_p, k_p), (mu_q, k_q) = model(P, Q)
+            loss = loss_fn(mu_p, k_p, g_p)
+            loss += loss_fn(mu_q, k_q, g_q)
+            loss /= 2.0
             
             # Update Average Loss
             AvgMeter_val.update(loss.item(), P.size(0))
             
-            # Compute average metrics so far
-            rre_avg = torch.cat(rre_list).mean().item()
-            rte_avg = torch.cat(rte_list).mean().item()
-            
             desc = (f"Val Epoch [{epoch}/{cfg.training.epochs}] "
-                    f"Loss: {AvgMeter_val.avg:.4f} | RRE: {rre_avg:.2f}° | RTE: {rte_avg:.4f}")
+                    f"Loss: {AvgMeter_val.avg:.4f} | (k_p: {k_p.mean().item():.2f}, k_q: {k_q.mean().item():.2f})")
             pbar.set_description(desc)
-    
-    # Calculate final metrics
-    rre_all = torch.cat(rre_list)
-    rte_all = torch.cat(rte_list)
     
     metrics = {
         'val_loss': AvgMeter_val.avg,
-        'val_rre_mean': rre_all.mean().item(),
-        'val_rte_mean': rte_all.mean().item(),
     }
             
     return metrics
 
 def logging_tensorboard(writer, result, epoch, optimizer):
     
-    
     writer.add_scalar("Loss/train/total", result['train_loss'], epoch)
     writer.add_scalar("Loss/val/total", result['val_loss'], epoch)
     
-    writer.add_scalar("Metrics/val/RRE_mean", result['val_rre_mean'], epoch)
-    writer.add_scalar("Metrics/val/RTE_mean", result['val_rte_mean'], epoch)
     writer.add_scalar("Learning_Rate", optimizer.param_groups[0]['lr'], epoch)
     

@@ -1,6 +1,6 @@
 defaults:
   - _self_
-  - model: dcp
+  - model: pointnet_v3
   - optim: sgd
   - override hydra/job_logging: default
   - override hydra/hydra_logging: default
@@ -18,7 +18,7 @@ device: cuda:0
 
 training:
   batch_size: 32
-  epochs: 250
+  epochs: 50
   
 data:
   name: modelnet40
@@ -33,8 +33,4 @@ data:
   distance_range: 0.5
 
 loss:
-  _target_: utils.loss.ELBOObjective
-  beta: 0.1
-
-prune:
-  ratio: 0.5
+  _target_: utils.loss.VMFLoss
